@@ -267,6 +267,16 @@ export class RobompStack extends cdk.Stack {
     );
 
     // ── ALB ─────────────────────────────────────────────────────────────────
+    // ALB requires the ACM certificate to live in the same region as the load balancer.
+    // Cross-region ARNs fail at deploy with a vague "Certificate ARN is not valid".
+    const certRegion = cdk.Arn.split(props.certificateArn, cdk.ArnFormat.SLASH_RESOURCE_NAME).region;
+    if (certRegion && this.region && certRegion !== this.region) {
+      throw new Error(
+        `certificateArn is in ${certRegion} but this stack deploys to ${this.region}. ` +
+          `Request/import the cert in ${this.region}, or redeploy with CDK_DEFAULT_REGION=${certRegion}.`,
+      );
+    }
+
     const certificate = acm.Certificate.fromCertificateArn(
       this,
       "Certificate",

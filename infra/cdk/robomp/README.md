@@ -26,7 +26,9 @@ an internet-facing Application Load Balancer.
 ## Prerequisites
 
 1. AWS credentials with rights to deploy the stack.
-2. An **ACM certificate** in the same region as the stack (for the ALB).
+2. An **ACM certificate in the same region as the stack** (for the ALB).
+   ACM certs are regional — a `us-east-2` cert cannot attach to a `us-east-1` ALB.
+   Match `CDK_DEFAULT_REGION` / `aws configure get region` to the cert ARN region.
 3. A GHCR-published robomp image built from this fork (pi source baked in).
 4. After deploy: fill the Secrets Manager JSON (`REPLACE_ME` keys).
 
