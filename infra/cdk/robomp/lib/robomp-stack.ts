@@ -116,6 +116,36 @@ export class RobompStack extends cdk.Stack {
     });
     cdk.Tags.of(vpc).add("robomp:isolation", "dedicated-vpc-no-peering");
 
+    // CloudWatch Logs requires an explicit CMK grant; LogGroup does not add it.
+    key.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: "AllowCloudWatchLogs",
+        principals: [
+          new iam.ServicePrincipal(
+            `logs.${cdk.Stack.of(this).region}.amazonaws.com`,
+          ),
+        ],
+        actions: [
+          "kms:Encrypt*",
+          "kms:Decrypt*",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:Describe*",
+        ],
+        resources: ["*"],
+        conditions: {
+          ArnLike: {
+            "kms:EncryptionContext:aws:logs:arn": cdk.Stack.of(this).formatArn({
+              service: "logs",
+              resource: "log-group",
+              resourceName: "*",
+              arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME,
+            }),
+          },
+        },
+      }),
+    );
+
     const flowLogGroup = new logs.LogGroup(this, "VpcFlowLogs", {
       retention: logs.RetentionDays.ONE_MONTH,
       encryptionKey: key,
