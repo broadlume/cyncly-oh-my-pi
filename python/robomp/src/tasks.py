@@ -359,9 +359,16 @@ async def review_pr(
     delivery_id: str,
     attempts: int = 0,
     slot_uid: int | None = None,
+    force_rereview: bool = False,
 ) -> None:
     pr_node = payload.get("pull_request") or {}
     pr_number = int(pr_node.get("number") or 0)
+    if pr_number <= 0:
+        # Maintainer re-review arrives as issue_comment on the PR; the PR number
+        # is issue.number in that payload shape.
+        issue_node = payload.get("issue") or {}
+        if isinstance(issue_node, Mapping) and "pull_request" in issue_node:
+            pr_number = int(issue_node.get("number") or 0)
     repo_payload = payload.get("repository") or {}
     repo_full = str(repo_payload.get("full_name") or "")
     if pr_number <= 0 or not repo_full:
@@ -378,10 +385,22 @@ async def review_pr(
     labels = {label.lower() for label in issue.labels}
     key = issue_key(repo.full_name, pr_number)
     review_labeled = "triaged" in labels or any(label.startswith("review:") for label in labels)
-    if db.has_successful_tool_call(key, "submit_pr_review"):
+    directive = None
+    if force_rereview:
+        log.info("forced re-review", extra={"repo": repo_full, "pr": pr_number})
+        await _run_workspace_op(sandbox.remove_workspace, repo=repo.full_name, number=pr_number)
+        db.clear_staged_review_comments(key)
+        directive = await _attach_thread(
+            github,
+            _directive_from_payload(payload),
+            repo.full_name,
+            pr_number,
+            is_pr=True,
+        )
+    elif db.has_successful_tool_call(key, "submit_pr_review"):
         log.info("skip: PR review already submitted", extra={"repo": repo_full, "pr": pr_number})
         return
-    if review_labeled:
+    elif review_labeled:
         log.info(
             "review labels present without submitted review; retrying",
             extra={"repo": repo_full, "pr": pr_number, "labels": sorted(labels)},
@@ -422,7 +441,13 @@ async def review_pr(
         slot_uid=slot_uid,
         natives_cache=sandbox.natives_cache,
     )
-    await run_task(task_kind="review_pr", inputs=inputs, pr_number=pr_number, pr=pr)
+    await run_task(
+        task_kind="review_pr",
+        inputs=inputs,
+        pr_number=pr_number,
+        pr=pr,
+        directive=directive,
+    )
     return
 
 

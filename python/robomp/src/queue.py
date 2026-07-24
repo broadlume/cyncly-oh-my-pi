@@ -13,6 +13,7 @@ from robomp import tasks
 from robomp.cancellation import clear_current_event, set_current_event
 from robomp.config import Settings
 from robomp.db import Database, EventRow
+from robomp.github_events import is_rereview_request
 from robomp.github_backend import GitHubBackend
 from robomp.sandbox import GitTransport, SandboxManager, _reap_slot
 from robomp.slot_pool import SlotPool
@@ -397,17 +398,37 @@ class WorkerPool:
         elif event == "issue_comment" and action == "created":
             issue = row.payload.get("issue") or {}
             if "pull_request" in issue:
-                await tasks.handle_pr_conversation(
-                    settings=self.settings,
-                    db=self.db,
-                    github=self.github,
-                    sandbox=self.sandbox,
-                    git_transport=self.git_transport,
-                    payload=row.payload,
-                    delivery_id=row.delivery_id,
-                    attempts=row.attempts,
-                    slot_uid=slot_uid,
-                )
+                directive = row.payload.get("_robomp_directive")
+                directive_body = None
+                if isinstance(directive, dict):
+                    raw_body = directive.get("body")
+                    if isinstance(raw_body, str):
+                        directive_body = raw_body
+                if directive_body is not None and is_rereview_request(directive_body):
+                    await tasks.review_pr(
+                        settings=self.settings,
+                        db=self.db,
+                        github=self.github,
+                        sandbox=self.sandbox,
+                        git_transport=self.git_transport,
+                        payload=row.payload,
+                        delivery_id=row.delivery_id,
+                        attempts=row.attempts,
+                        slot_uid=slot_uid,
+                        force_rereview=True,
+                    )
+                else:
+                    await tasks.handle_pr_conversation(
+                        settings=self.settings,
+                        db=self.db,
+                        github=self.github,
+                        sandbox=self.sandbox,
+                        git_transport=self.git_transport,
+                        payload=row.payload,
+                        delivery_id=row.delivery_id,
+                        attempts=row.attempts,
+                        slot_uid=slot_uid,
+                    )
             else:
                 await tasks.handle_comment(
                     settings=self.settings,

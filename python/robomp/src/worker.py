@@ -426,7 +426,19 @@ def _build_prompt(
         return persona.kickoff(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
     if task_kind == "review_pr":
         assert pr is not None
-        return persona.kickoff_pr_review(repo=inputs.repo, pr=pr, workspace=inputs.workspace)
+        prompt = persona.kickoff_pr_review(repo=inputs.repo, pr=pr, workspace=inputs.workspace)
+        if directive is not None:
+            request = directive.body.strip() or "please re-review"
+            prompt = (
+                f"# Re-review requested by @{directive.author}\n\n"
+                f"{request}\n\n"
+                "This is a **forced re-review**. The PR head was refreshed to the latest "
+                "`refs/pull/<n>/head`. Re-run Phase 0–2 from scratch against the current "
+                "checkout. Prior reviews are historical context only — do not assume old "
+                "findings still apply.\n\n"
+                f"{prompt}"
+            )
+        return prompt
     if task_kind == "handle_comment":
         assert comment is not None
         issue_row = inputs.db.get_issue(issue_key(inputs.repo.full_name, inputs.issue.number))

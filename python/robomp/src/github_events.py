@@ -193,6 +193,23 @@ def is_implementation_authorizer(
     return False
 
 
+_REREVIEW_RE = re.compile(
+    r"\b(?:re[- ]?review|review(?:\s+this)?\s+again)\b",
+    re.IGNORECASE,
+)
+
+
+def is_rereview_request(body: str | None) -> bool:
+    """True when a directive body explicitly asks for another PR review pass.
+
+    Conservative on purpose: only an explicit re-review phrase re-runs Phase 1+2.
+    Ordinary maintainer questions on incoming PRs stay ignored.
+    """
+    if not isinstance(body, str) or not body.strip():
+        return False
+    return _REREVIEW_RE.search(body) is not None
+
+
 def _pr_review_pr(pr: Mapping[str, Any], repo: str, action: str, bot_login: str) -> RouteDecision:
     """Build a `review_pr` decision for an incoming PR, or the matching skip."""
     if str(pr.get("state") or "open") != "open":
@@ -323,10 +340,9 @@ def route(
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "comment missing issue number")
         if "pull_request" in issue:
-            # Conversation comments on incoming contributor PRs are intentionally
-            # ignored for now: the one-shot review runs on open, and re-review
-            # directives are not wired yet. Only bot-authored PRs resume a live
-            # amend-and-push workflow.
+            # Bot-authored PRs resume the amend-and-push workflow. Incoming
+            # contributor PRs stay quiet unless a maintainer/reviewer bot
+            # explicitly asks for a re-review.
             key = _resolve_pr_key(number)
             login, assoc = _submitter_info(comment)
             assoc = _effective_association(login, assoc, payload.get("repository"), repo)
@@ -342,6 +358,20 @@ def route(
                     submitter=login,
                     association=assoc,
                     **_directive_kwargs(comment, login, assoc),
+                )
+            directive_kw = _directive_kwargs(comment, login, assoc)
+            if directive_kw.get("directive") and is_rereview_request(directive_kw.get("directive_body")):
+                if not pr_review_enabled:
+                    return RouteDecision("skip", None, repo, issue_key(repo, number), "PR review disabled")
+                return RouteDecision(
+                    "queue",
+                    "review_pr",
+                    repo,
+                    issue_key(repo, number),
+                    f"issue_comment.created re-review on PR #{number}",
+                    submitter=login,
+                    association=assoc,
+                    **directive_kw,
                 )
             return RouteDecision("skip", None, repo, issue_key(repo, number), "incoming PR comments ignored")
         key = issue_key(repo, number)
@@ -436,6 +466,7 @@ __all__ = [
     "extract_mention",
     "is_maintainer",
     "is_implementation_authorizer",
+    "is_rereview_request",
     "rate_limit_cap",
     "route",
     "verify_signature",

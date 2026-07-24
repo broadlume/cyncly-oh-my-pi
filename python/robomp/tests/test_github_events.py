@@ -9,6 +9,7 @@ from robomp.github_events import (
     extract_mention,
     is_implementation_authorizer,
     is_maintainer,
+    is_rereview_request,
     rate_limit_cap,
     route,
     verify_signature,
@@ -300,7 +301,7 @@ def test_route_incoming_pr_comment_skips() -> None:
     assert "incoming PR comments ignored" == decision.reason
 
 
-def test_route_incoming_pr_comment_with_maintainer_mention_still_skips() -> None:
+def test_route_incoming_pr_comment_with_maintainer_rereview_queues_review_pr() -> None:
     decision = route(
         "issue_comment",
         {
@@ -309,6 +310,30 @@ def test_route_incoming_pr_comment_with_maintainer_mention_still_skips() -> None
                 "user": {"login": "can1357"},
                 "author_association": "OWNER",
                 "body": "@robomp-bot please re-review",
+            },
+            "issue": {"number": 9, "user": {"login": "contributor"}, "pull_request": {"url": "x"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.should_queue
+    assert decision.task == "review_pr"
+    assert decision.issue_key == "octo/widget#9"
+    assert decision.directive is True
+    assert decision.directive_body == "please re-review"
+    assert "re-review" in decision.reason
+
+
+def test_route_incoming_pr_comment_with_maintainer_non_rereview_still_skips() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "can1357"},
+                "author_association": "OWNER",
+                "body": "@robomp-bot what do you think about the naming?",
             },
             "issue": {"number": 9, "user": {"login": "contributor"}, "pull_request": {"url": "x"}},
             "repository": {"full_name": "octo/widget"},
@@ -544,6 +569,25 @@ def test_rate_limit_cap_default_tier_for_unknown_and_first_timer() -> None:
 
 
 # ---------- mention + directive ----------
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("please re-review", True),
+        ("Re-review after the latest push", True),
+        ("rereview this", True),
+        ("can you review again?", True),
+        ("please review this again", True),
+        ("what do you think?", False),
+        ("review the naming", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_rereview_request(body: str | None, expected: bool) -> None:
+    assert is_rereview_request(body) is expected
+
 
 
 def test_extract_mention_returns_body_minus_mention() -> None:
@@ -848,6 +892,28 @@ def test_route_reviewer_bot_comment_on_incoming_pr_is_ignored() -> None:
     )
     assert not decision.should_queue
     assert decision.reason == "incoming PR comments ignored"
+
+
+def test_route_reviewer_bot_rereview_on_incoming_pr_queues_review_pr() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "chatgpt-codex-connector[bot]", "type": "Bot"},
+                "body": "please re-review after the author push",
+            },
+            "issue": {"number": 9, "user": {"login": "contributor"}, "pull_request": {"url": "x"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        reviewer_bots=frozenset({"chatgpt-codex-connector"}),
+    )
+    assert decision.should_queue
+    assert decision.task == "review_pr"
+    assert decision.directive is True
+    assert decision.directive_author == "chatgpt-codex-connector"
 
 
 def test_route_reviewer_bot_review_comment_is_directive() -> None:

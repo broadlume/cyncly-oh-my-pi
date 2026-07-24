@@ -93,14 +93,14 @@ has no originating bot issue.
 
 ### 2b. Gate incoming-PR comments ("don't run on comments unless I ask")
 
-Today `issue_comment.created` on **any** PR queues `handle_pr_conversation`. For incoming
-(non-bot) PRs that would make the bot respond to every comment. Change the PR branch of the
-`issue_comment` handler to:
+For incoming (non-bot) PRs, conversation comments stay ignored by default. Implemented
+behavior:
 
 - PR author **is** the bot → `handle_pr_conversation` (unchanged).
 - PR author is **not** the bot → **skip**, *unless* `_directive_kwargs(...)` is non-empty
-  (a maintainer `@bot` mention or a configured reviewer bot). A directive routes to the
-  existing directive path; only an explicit "re-review" directive re-runs the review.
+  **and** the body is an explicit re-review request (`re-review` / `rereview` /
+  `review again`). That queues `review_pr` with `force_rereview=True` (workspace teardown +
+  fresh PR-head checkout + idempotency bypass). Ordinary maintainer questions still skip.
 
 The PR author is on `payload.issue.user.login` for `issue_comment` events. `synchronize`,
 `edited`, etc. need no change (they already skip).
@@ -332,8 +332,8 @@ killed without a redeploy; check it in `route()`'s new branch. Reuse the existin
 | `pull_request.opened` | draft / bot-authored | skip |
 | `pull_request.synchronize` (new commits) | — | **skip** (no re-review) |
 | `pull_request.edited` / others | — | skip |
-| `issue_comment.created` on incoming PR | not a directive | **skip** |
-| `issue_comment.created` on incoming PR | maintainer `@bot` / reviewer bot | directive path (may re-review) |
+| `issue_comment.created` on incoming PR | not a re-review directive | **skip** |
+| `issue_comment.created` on incoming PR | maintainer/reviewer `@bot` with explicit re-review phrasing | **`review_pr` (force)** |
 | `issue_comment.created` on bot PR | — | `handle_pr_conversation` (unchanged) |
 | `pull_request.closed` | has review workspace | `cleanup_workspace` |
 

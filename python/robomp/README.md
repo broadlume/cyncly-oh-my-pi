@@ -17,7 +17,7 @@ and branches:
 - `enhancement` / `proposal` → one comment, no PR.
 - `invalid` / `duplicate` → one brief comment.
 
-Follow-up issue comments and PR review comments resume the same omp session
+Incoming contributor PRs get a one-shot review on open; a maintainer (or configured reviewer bot) can force another pass with an explicit `@bot` re-review comment (e.g. `@roboomp please re-review`). Follow-up issue comments and PR review comments resume the same omp session
 (`--continue` against the persisted JSONL transcript). On orchestrator
 restart, in-flight events are re-queued and resume the same way.
 

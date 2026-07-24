@@ -2131,6 +2131,98 @@ async def test_review_pr_skips_after_submitted_review(
     close_database()
 
 
+async def test_review_pr_force_rereview_bypasses_submitted_guard(
+    settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
+) -> None:
+    from robomp import tasks
+    from robomp.github_client import GitHubClient, IssueInfo, PullRequestInfo, RepoInfo
+
+    sandbox = _RecordingSandbox(tmp_path)
+    db = get_database(settings.sqlite_path)
+    key = issue_key("octo/widget", 900)
+    db.log_tool_call(issue_key=key, tool="submit_pr_review", args={"body": "done"}, result={"review_id": 12})
+    db.stage_review_comment(issue_key=key, path="a.py", line=1, body="stale")
+    repo = RepoInfo(
+        full_name="octo/widget", default_branch="main", clone_url="https://github.com/octo/widget.git", private=False
+    )
+    issue = IssueInfo(
+        repo="octo/widget",
+        number=900,
+        title="Fix parser",
+        body="body",
+        state="open",
+        author="alice",
+        labels=("triaged", "review:p1"),
+        is_pull_request=True,
+    )
+    pr = PullRequestInfo(
+        repo="octo/widget",
+        number=900,
+        html_url="https://github.com/octo/widget/pull/900",
+        head_ref="alice/fix-parser",
+        base_ref="main",
+        state="open",
+        author="alice",
+        head_repo="alice/widget",
+    )
+
+    async def _get_repo(self, repo_full: str):
+        return repo
+
+    async def _get_issue(self, repo_full: str, number: int):
+        return issue
+
+    async def _get_pull_request(self, repo_full: str, number: int):
+        return pr
+
+    async def _list_comments(self, repo_full: str, number: int):
+        return []
+
+    async def _list_review_comments(self, repo_full: str, number: int):
+        return []
+
+    async def _list_pr_reviews(self, repo_full: str, number: int):
+        return []
+
+    monkeypatch.setattr(GitHubClient, "get_repo", _get_repo)
+    monkeypatch.setattr(GitHubClient, "get_issue", _get_issue)
+    monkeypatch.setattr(GitHubClient, "get_pull_request", _get_pull_request)
+    monkeypatch.setattr(GitHubClient, "list_comments", _list_comments)
+    monkeypatch.setattr(GitHubClient, "list_review_comments", _list_review_comments)
+    monkeypatch.setattr(GitHubClient, "list_pr_reviews", _list_pr_reviews)
+
+    payload = {
+        "action": "created",
+        "issue": {
+            "number": 900,
+            "user": {"login": "alice"},
+            "pull_request": {"url": "https://api.github.com/repos/octo/widget/pulls/900"},
+        },
+        "comment": {"user": {"login": "can1357"}, "body": "@robomp-bot please re-review", "id": 12},
+        "repository": {"full_name": "octo/widget"},
+        "_robomp_directive": {"body": "please re-review", "author": "can1357"},
+    }
+    await tasks.review_pr(
+        settings=settings,
+        db=db,
+        github=GitHubClient("t"),
+        sandbox=sandbox,
+        git_transport=LocalGitTransport(token=None),
+        payload=payload,
+        delivery_id="d-review-force",
+        force_rereview=True,
+    )
+
+    assert sandbox.remove_calls == [("octo/widget", 900)]
+    assert len(stub_run_task) == 1
+    assert stub_run_task[0]["task_kind"] == "review_pr"
+    assert stub_run_task[0]["directive"] is not None
+    assert stub_run_task[0]["directive"].body == "please re-review"
+    assert sandbox.ensure_calls[0]["pr_head"] == 900
+    assert db.list_staged_review_comments(key) == []
+    close_database()
+
+
 async def test_handle_comment_directive_bootstraps_untriaged_issue(
     settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
 ) -> None:

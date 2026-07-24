@@ -114,3 +114,41 @@ async def test_dispatch_pr_synchronize_is_noop(
     await _make_pool(settings, db)._dispatch(_pr_row("synchronize"))  # noqa: SLF001
 
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_incoming_pr_rereview_comment_routes_to_review_pr(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict] = []
+
+    async def fake_review_pr(**kwargs) -> None:
+        seen.append(kwargs)
+
+    async def fake_handle_pr_conversation(**_kwargs) -> None:
+        raise AssertionError("re-review must not go through handle_pr_conversation")
+
+    monkeypatch.setattr(tasks, "review_pr", fake_review_pr)
+    monkeypatch.setattr(tasks, "handle_pr_conversation", fake_handle_pr_conversation)
+
+    row = EventRow(
+        delivery_id="rereview1",
+        event_type="issue_comment",
+        repo="octo/widget",
+        issue_key="octo/widget#9",
+        payload={
+            "action": "created",
+            "issue": {"number": 9, "user": {"login": "alice"}, "pull_request": {"url": "x"}},
+            "comment": {"user": {"login": "can1357"}, "body": "@robomp-bot please re-review"},
+            "_robomp_directive": {"body": "please re-review", "author": "can1357"},
+        },
+        received_at="2026-01-01T00:00:00Z",
+        state="running",
+        attempts=1,
+        last_error=None,
+    )
+    await _make_pool(settings, db)._dispatch(row)  # noqa: SLF001
+
+    assert len(seen) == 1
+    assert seen[0]["force_rereview"] is True
+
