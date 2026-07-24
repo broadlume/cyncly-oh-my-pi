@@ -194,7 +194,7 @@ export class RobompStack extends cdk.Stack {
 
     const instanceSg = new ec2.SecurityGroup(this, "InstanceSg", {
       vpc,
-      description: "robomp EC2 — ALB only ingress; HTTPS egress",
+      description: "robomp EC2 - ALB only ingress; HTTPS egress",
       allowAllOutbound: false,
     });
     instanceSg.addIngressRule(albSg, ec2.Port.tcp(8080), "ALB to robomp");
@@ -206,7 +206,7 @@ export class RobompStack extends cdk.Stack {
     // ── IAM: deny-by-default; only GetSecretValue on THIS secret ────────────
     const role = new iam.Role(this, "InstanceRole", {
       assumedBy: new iam.ServicePrincipal("ec2.amazonaws.com"),
-      description: "robomp EC2 — Secrets Manager read on stack secret only",
+      description: "robomp EC2 - Secrets Manager read on stack secret only",
     });
     secret.grantRead(role);
     role.addToPolicy(
