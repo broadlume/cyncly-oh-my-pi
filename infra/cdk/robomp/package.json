@@ -1,0 +1,27 @@
+{
+  "name": "robomp-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -w -p tsconfig.json",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.204.0",
+    "constructs": "^10.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "aws-cdk": "^2.1018.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  }
+}

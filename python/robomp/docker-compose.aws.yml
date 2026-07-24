@@ -1,0 +1,120 @@
+# Self-contained AWS / hardened EC2 compose for robomp.
+# Does not merge with docker-compose.yml — keeps local and AWS paths independent.
+#
+#   docker compose --env-file /etc/robomp/.env -f docker-compose.aws.yml up -d
+
+services:
+  robomp:
+    image: ${ROBOMP_IMAGE:?ROBOMP_IMAGE must be set}
+    pull_policy: always
+    container_name: robomp
+    stop_grace_period: 30s
+    restart: unless-stopped
+    environment:
+      ROBOMP_GH_PROXY_URL: http://gh-proxy:8081
+      ROBOMP_GH_PROXY_HMAC_KEY: ${ROBOMP_GH_PROXY_HMAC_KEY:?ROBOMP_GH_PROXY_HMAC_KEY must be set}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?GITHUB_WEBHOOK_SECRET must be set}
+      ROBOMP_BOT_LOGIN: ${ROBOMP_BOT_LOGIN:?ROBOMP_BOT_LOGIN must be set}
+      ROBOMP_GIT_AUTHOR_NAME: ${ROBOMP_GIT_AUTHOR_NAME:-}
+      ROBOMP_GIT_AUTHOR_EMAIL: ${ROBOMP_GIT_AUTHOR_EMAIL:?ROBOMP_GIT_AUTHOR_EMAIL must be set}
+      ROBOMP_REPO_ALLOWLIST: ${ROBOMP_REPO_ALLOWLIST:?ROBOMP_REPO_ALLOWLIST must be set}
+      ROBOMP_MAINTAINER_LOGINS: ${ROBOMP_MAINTAINER_LOGINS:-}
+      ROBOMP_REVIEWER_BOTS: ${ROBOMP_REVIEWER_BOTS:-}
+      ROBOMP_PR_REVIEW_ENABLED: ${ROBOMP_PR_REVIEW_ENABLED:-true}
+      ROBOMP_MODEL: ${ROBOMP_MODEL:-anthropic/claude-sonnet-4-6}
+      ROBOMP_PROVIDER: ${ROBOMP_PROVIDER:-}
+      ROBOMP_THINKING: ${ROBOMP_THINKING:-high}
+      ROBOMP_MAX_CONCURRENCY: ${ROBOMP_MAX_CONCURRENCY:-8}
+      ROBOMP_TASK_TIMEOUT_SECONDS: ${ROBOMP_TASK_TIMEOUT_SECONDS:-2400}
+      ROBOMP_TASK_TIMEOUT_HARD_GRACE_SECONDS: ${ROBOMP_TASK_TIMEOUT_HARD_GRACE_SECONDS:-60}
+      ROBOMP_REQUEST_TIMEOUT_SECONDS: ${ROBOMP_REQUEST_TIMEOUT_SECONDS:-120}
+      ROBOMP_RATE_LIMIT_WINDOW_SECONDS: ${ROBOMP_RATE_LIMIT_WINDOW_SECONDS:-3600}
+      ROBOMP_RATE_LIMIT_DEFAULT: ${ROBOMP_RATE_LIMIT_DEFAULT:-3}
+      ROBOMP_RATE_LIMIT_CONTRIBUTOR: ${ROBOMP_RATE_LIMIT_CONTRIBUTOR:-10}
+      ROBOMP_RATE_LIMIT_UNLIMITED: ${ROBOMP_RATE_LIMIT_UNLIMITED:-}
+      ROBOMP_QUESTION_AUTOCLOSE_ENABLED: ${ROBOMP_QUESTION_AUTOCLOSE_ENABLED:-true}
+      ROBOMP_QUESTION_AUTOCLOSE_HOURS: ${ROBOMP_QUESTION_AUTOCLOSE_HOURS:-4}
+      ROBOMP_QUESTION_AUTOCLOSE_SCAN_SECONDS: ${ROBOMP_QUESTION_AUTOCLOSE_SCAN_SECONDS:-60}
+      ROBOMP_REPLAY_TOKEN: ${ROBOMP_REPLAY_TOKEN:-}
+      ROBOMP_OMP_COMMAND: omp
+      ROBOMP_WORKSPACE_ROOT: /data/workspaces
+      ROBOMP_SQLITE_PATH: /data/robomp.sqlite
+      ROBOMP_LOG_DIR: /data/logs
+      ROBOMP_BIND_HOST: ${ROBOMP_BIND_HOST:-0.0.0.0}
+      ROBOMP_BIND_PORT: ${ROBOMP_BIND_PORT:-8080}
+      # Baked into the GHCR image from pi-runtime (/pi). Do not mount a host checkout.
+      PI_ROOT: /pi
+    depends_on:
+      gh-proxy:
+        condition: service_started
+      litellm:
+        condition: service_started
+    networks:
+      - default
+      - robomp_internal
+    volumes:
+      - robomp_data:/data
+      - /etc/robomp/models.container.yml:/srv/agent-home-stage/.omp/agent/models.yml:ro
+      - /etc/robomp/AGENT.md:/srv/agent-home-stage/.agent/AGENTS.md:ro
+      - /etc/robomp/rules:/srv/agent-home-stage/.agent/rules:ro
+    ports:
+      - "8080:8080"
+
+  gh-proxy:
+    image: ${ROBOMP_IMAGE:?ROBOMP_IMAGE must be set}
+    pull_policy: always
+    container_name: gh-proxy
+    restart: unless-stopped
+    command: ["python", "-m", "robomp.proxy", "serve"]
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:?GITHUB_TOKEN must be set}
+      ROBOMP_GH_PROXY_HMAC_KEY: ${ROBOMP_GH_PROXY_HMAC_KEY:?ROBOMP_GH_PROXY_HMAC_KEY must be set}
+      ROBOMP_WORKSPACE_ROOT: /data/workspaces
+      ROBOMP_SQLITE_PATH: /data/robomp.sqlite
+      ROBOMP_LOG_DIR: /data/logs
+      ROBOMP_GH_PROXY_BIND_HOST: 0.0.0.0
+      ROBOMP_GH_PROXY_BIND_PORT: 8081
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:?GITHUB_WEBHOOK_SECRET must be set}
+      ROBOMP_BOT_LOGIN: ${ROBOMP_BOT_LOGIN:?ROBOMP_BOT_LOGIN must be set}
+      ROBOMP_GIT_AUTHOR_EMAIL: ${ROBOMP_GIT_AUTHOR_EMAIL:?ROBOMP_GIT_AUTHOR_EMAIL must be set}
+      ROBOMP_REPO_ALLOWLIST: ${ROBOMP_REPO_ALLOWLIST:?ROBOMP_REPO_ALLOWLIST must be set}
+    networks:
+      - default
+      - robomp_internal
+    volumes:
+      - robomp_data:/data
+
+  litellm:
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:main-stable}
+    pull_policy: always
+    container_name: litellm
+    restart: unless-stopped
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY must be set}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AZURE_API_KEY: ${AZURE_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    volumes:
+      - /etc/robomp/litellm.config.yaml:/app/config.yaml:ro
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "4000"
+    networks:
+      default:
+        aliases:
+          - llm-gateway.internal
+
+networks:
+  default: {}
+  robomp_internal:
+    internal: true
+
+volumes:
+  robomp_data:
+    external: true
+    name: robomp_robomp_data

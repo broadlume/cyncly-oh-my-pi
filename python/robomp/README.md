@@ -78,6 +78,10 @@ Build invalidation is bounded: editing roboomp Python touches only the
 runtime layer; editing pi source rebuilds `oh-my-pi/pi:dev`, which
 roboomp's `Dockerfile.robomp` extends via `FROM ${PI_BASE}`.
 
+### AWS (hardened EC2 + ALB)
+
+See [`infra/cdk/robomp/README.md`](../../infra/cdk/robomp/README.md) for a TypeScript CDK stack that deploys robomp + gh-proxy + LiteLLM on an isolated private EC2 behind an HTTPS ALB (path `/webhook/github` only). The instance role can only read the stack secret; SSH/SSM/ECR/S3 are denied.
+
 ### Public URL
 
 roboomp does not ship a tunnel. Cloudflare, smee, ngrok are all fine. The

@@ -1,0 +1,16 @@
+# omp models.yml for the robomp container. Providers are routed through the
+# colocated LiteLLM gateway (compose network alias llm-gateway.internal).
+# Bootstrap replaces __LITELLM_MASTER_KEY__ with the secret value.
+providers:
+  anthropic:
+    baseUrl: http://llm-gateway.internal:4000
+    api: anthropic-messages
+    apiKey: __LITELLM_MASTER_KEY__
+  openai:
+    baseUrl: http://llm-gateway.internal:4000/v1
+    api: openai-completions
+    apiKey: __LITELLM_MASTER_KEY__
+  openai-codex:
+    baseUrl: http://llm-gateway.internal:4000/v1
+    api: openai-completions
+    apiKey: __LITELLM_MASTER_KEY__
