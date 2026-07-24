@@ -32,11 +32,16 @@ FROM rust:1.86-slim-bookworm AS natives-builder
 ARG BUN_VERSION
 ENV BUN_INSTALL=/opt/bun \
     PATH=/opt/bun/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin \
-    CARGO_TERM_COLOR=never
+    CARGO_TERM_COLOR=never \
+    CMAKE_POLICY_VERSION_MINIMUM=3.5
 
+# Native addon build needs a C/C++ toolchain + cmake (bundled Opus via
+# audiopus_sys) + libclang (bindgen for maudio-sys). These are also what the
+# ARC runner image installs; the slim rust image does not ship them.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl ca-certificates pkg-config libssl-dev unzip git \
+        build-essential cmake ninja-build clang libclang-dev llvm \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
