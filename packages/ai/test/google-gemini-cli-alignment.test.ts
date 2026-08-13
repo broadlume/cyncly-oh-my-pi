@@ -154,6 +154,7 @@ describe("Google Gemini CLI alignment", () => {
 		expect(shouldRefreshGeminiCliCredentials).toBe(geminiCliProvider.shouldRefreshGeminiCliCredentials);
 		expect(Object.hasOwn(geminiCliProvider, "refreshGeminiCliCredentialsIfNeeded")).toBe(false);
 	});
+
 	it("omits antigravity-only metadata in non-antigravity request payloads", () => {
 		const model = createModel("google-gemini-cli");
 		const payload = buildRequest(model, createContext(), "proj-123", {}, false) as {
@@ -367,7 +368,6 @@ describe("Google Gemini CLI alignment", () => {
 		}).result();
 
 		expect(result.stopReason).toBe("error");
-		expect(requestHeaders).toBeDefined();
 		expect(requestHeaders!.get("anthropic-beta")).toBe("interleaved-thinking-2025-05-14");
 		expect(requestHeaders!.get("X-Goog-Api-Client")).toBeNull();
 		expect(requestHeaders!.get("Client-Metadata")).toBeNull();
@@ -386,7 +386,6 @@ describe("Google Gemini CLI alignment", () => {
 			fetch: fetchMock,
 		}).result();
 
-		expect(requestHeaders).toBeDefined();
 		expect(requestHeaders!.get("User-Agent")).toMatch(/^antigravity\/hub\/[0-9.]+ /);
 	});
 
@@ -402,7 +401,7 @@ describe("Google Gemini CLI alignment", () => {
 					const encoder = new TextEncoder();
 					for (const chunk of sseChunks) {
 						controller.enqueue(encoder.encode(chunk));
-						await Bun.sleep(5);
+						await Promise.resolve();
 					}
 					controller.close();
 				},
@@ -465,7 +464,7 @@ describe("Google Gemini CLI alignment", () => {
 					const encoder = new TextEncoder();
 					for (const chunk of sseChunks) {
 						controller.enqueue(encoder.encode(chunk));
-						await Bun.sleep(5);
+						await Promise.resolve();
 					}
 					controller.close();
 				},
@@ -578,7 +577,7 @@ describe("Google Gemini CLI alignment", () => {
 						const encoder = new TextEncoder();
 						for (const chunk of chunks) {
 							controller.enqueue(encoder.encode(chunk));
-							await Bun.sleep(5);
+							await Promise.resolve();
 						}
 						controller.close();
 					},
@@ -625,7 +624,7 @@ describe("Google Gemini CLI alignment", () => {
 						const encoder = new TextEncoder();
 						for (const chunk of sseChunks) {
 							controller.enqueue(encoder.encode(chunk));
-							await Bun.sleep(5);
+							await Promise.resolve();
 						}
 						controller.close();
 					},
@@ -669,7 +668,7 @@ describe("Google Gemini CLI alignment", () => {
 						const encoder = new TextEncoder();
 						for (const chunk of sseChunks) {
 							controller.enqueue(encoder.encode(chunk));
-							await Bun.sleep(5);
+							await Promise.resolve();
 						}
 						controller.close();
 					},
@@ -822,7 +821,7 @@ describe("Google Gemini CLI alignment", () => {
 						const encoder = new TextEncoder();
 						for (const chunk of sseChunks) {
 							controller.enqueue(encoder.encode(chunk));
-							await Bun.sleep(5);
+							await Promise.resolve();
 						}
 						controller.close();
 					},

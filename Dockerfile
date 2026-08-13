@@ -35,14 +35,19 @@ ENV BUN_INSTALL=/opt/bun \
     CARGO_TERM_COLOR=never \
     CMAKE_POLICY_VERSION_MINIMUM=3.5
 
-# Native addon build needs a C/C++ toolchain + cmake (bundled Opus via
-# audiopus_sys) + libclang (bindgen for maudio-sys). These are also what the
-# ARC runner image installs; the slim rust image does not ship them.
+# clang/libclang-dev: bindgen for pipewire-sys/libspa-sys (Linux desktop capture);
+# cmake/make/ninja-build: audiopus_sys builds bundled libopus via CMake.
+# build-essential/llvm: full C/C++ toolchain, absent from the slim rust image.
+# bazelisk: hermetic bazel launcher for the native addon build (17.1.5+).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl ca-certificates pkg-config libssl-dev unzip git \
-        build-essential cmake ninja-build clang libclang-dev llvm \
-    && rm -rf /var/lib/apt/lists/*
+        build-essential clang libclang-dev llvm cmake make ninja-build \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL -o /usr/local/bin/bazelisk \
+        "https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-$(dpkg --print-architecture)" \
+    && chmod +x /usr/local/bin/bazelisk \
+    && ln -s /usr/local/bin/bazelisk /usr/local/bin/bazel
 
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
     && /opt/bun/bin/bun --version

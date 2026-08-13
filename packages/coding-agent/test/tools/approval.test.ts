@@ -166,6 +166,56 @@ describe("MCP fallback and prompt formatting", () => {
 	});
 });
 
+describe("decision policyKey scopes user policy to a sub-tool", () => {
+	// The write tool reports this decision for an `xd://knowledge_search` dispatch:
+	// the tier comes from the mounted tool, and the policyKey makes the user
+	// override key on the device instead of the invoking `write` tool (#7923).
+	const dispatch = tool("write", { tier: "exec", policyKey: "knowledge_search" });
+
+	it("consults tools.approval.<policyKey> for the user override", () => {
+		expect(resolveApproval(dispatch, {}, "always-ask", { knowledge_search: "allow" })).toMatchObject({
+			policy: "allow",
+			source: "user",
+			policyKey: "knowledge_search",
+		});
+		expect(resolveApproval(dispatch, {}, "always-ask", { knowledge_search: "prompt" }).policy).toBe("prompt");
+		expect(resolveApproval(dispatch, {}, "always-ask", { knowledge_search: "deny" }).policy).toBe("deny");
+	});
+
+	it("falls back to the invoking tool's own policy when the keyed one is unset", () => {
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "allow" }).policy).toBe("allow");
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "prompt" }).policy).toBe("prompt");
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "deny" }).policy).toBe("deny");
+	});
+
+	it("device policy wins over the invoking tool's policy", () => {
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "prompt", knowledge_search: "allow" }).policy).toBe(
+			"allow",
+		);
+		expect(resolveApproval(dispatch, {}, "always-ask", { write: "allow", knowledge_search: "deny" }).policy).toBe(
+			"deny",
+		);
+	});
+
+	it("names the policy key in user-deny refusals", () => {
+		expect(() => requiresApproval(dispatch, {}, "always-ask", { knowledge_search: "deny" })).toThrow(
+			'Tool "knowledge_search" is blocked by user policy',
+		);
+		expect(() => requiresApproval(dispatch, {}, "always-ask", { knowledge_search: "deny" })).toThrow(
+			'remove "tools.approval.knowledge_search: deny"',
+		);
+		expect(() => requiresApproval(dispatch, {}, "always-ask", { write: "deny" })).toThrow(
+			'remove "tools.approval.write: deny"',
+		);
+	});
+
+	it("does not change resolution for tools without a policyKey", () => {
+		const plain = tool("write", "exec");
+		expect(resolveApproval(plain, {}, "always-ask", { write: "allow" }).policy).toBe("allow");
+		expect(resolveApproval(plain, {}, "always-ask", { knowledge_search: "allow" }).policy).toBe("prompt");
+	});
+});
+
 describe("tool-owned dynamic approval declarations", () => {
 	it("classifies critical bash patterns through BashTool.approval", () => {
 		for (const command of [
@@ -273,6 +323,47 @@ describe("tool-owned dynamic approval declarations", () => {
 			reason: "Blocked by bash pattern: rm -rf *",
 		});
 	});
+
+	it("denies a dangerous command buried in a compound line", () => {
+		const settingsOverrides = {
+			"bash.patterns": [{ match: "rm -rf /*", approval: "deny" }],
+		};
+
+		const denied = {
+			tier: "exec",
+			override: true,
+			policy: "deny",
+			reason: "Blocked by bash pattern: rm -rf /*",
+		} as const;
+		// Dangerous segment in any position (not just leading) must trigger deny.
+		expect(bashApproval("rm -rf /tmp/scratch-a", settingsOverrides)).toEqual(denied);
+		expect(bashApproval("cd /tmp && rm -rf /tmp/scratch-b && echo done", settingsOverrides)).toEqual(denied);
+		expect(bashApproval("echo start; rm -rf /var/x", settingsOverrides)).toEqual(denied);
+		expect(bashApproval("cat f | rm -rf /var/x", settingsOverrides)).toEqual(denied);
+		// Single `&` (background) and subshells are command boundaries too.
+		expect(bashApproval("sleep 1 & rm -rf /tmp/scratch-b", settingsOverrides)).toEqual(denied);
+		expect(bashApproval("(rm -rf /tmp/scratch-b)", settingsOverrides)).toEqual(denied);
+		// Quotes around the binary do not hide it from a deny rule.
+		expect(bashApproval('cd /tmp && "rm" -rf /tmp/scratch-b', settingsOverrides)).toEqual(denied);
+
+		// Segments that do not match the glob must not be denied by it. `rm -rf`
+		// on a relative target has no leading `/`, so the `/`-anchored rule stays out.
+		expect(bashApproval("cd /tmp && rm -rf relative-dir", settingsOverrides)).toBe("exec");
+		expect(bashApproval("cd /tmp && ls -la /nope", settingsOverrides)).toBe("exec");
+	});
+
+	it("prompts when a dangerous segment matches a prompt rule in a compound line", () => {
+		const settingsOverrides = {
+			"bash.patterns": [{ match: "curl *", approval: "prompt" }],
+		};
+
+		expect(bashApproval("cd /tmp && curl http://x -o out.txt", settingsOverrides)).toEqual({
+			tier: "exec",
+			override: true,
+			policy: "prompt",
+			reason: "Prompt required by bash pattern: curl *",
+		});
+	});
 	it("never auto-approves a command that only prefixes an allow pattern", () => {
 		const settingsOverrides = {
 			"bash.patterns": [{ match: "git *", approval: "allow" }],
@@ -288,6 +379,9 @@ describe("tool-owned dynamic approval declarations", () => {
 			"git $(rm file.txt)",
 			"git `rm file.txt` status",
 			"git status > /etc/passwd",
+			"git -c alias.x='!touch /tmp/pwn; printf ok' x",
+			'git -c alias.x="!touch /tmp/pwn; printf ok" x',
+			"git -c alias.x=!touch\\ /tmp/pwn\\;\\ printf\\ ok x",
 			"git status < seed",
 			// Different binary resolution than the pattern names.
 			"FOO=1 git status",
@@ -304,6 +398,16 @@ describe("tool-owned dynamic approval declarations", () => {
 		for (const command of ["git status", "git status --short", "git  status", "git\tstatus"]) {
 			expect(bashApproval(command, settingsOverrides)).toEqual({ tier: "write", policy: "allow" });
 		}
+	});
+
+	it("allows literal shell metacharacters in quoted arguments", () => {
+		const settingsOverrides = {
+			"bash.patterns": [{ match: "cargo *", approval: "allow" }],
+		};
+		const command =
+			"cargo bench --manifest-path layers/layer3/Cargo.toml --bench standardized_criterion -- --full '^layer3/write/file-wal/batch-(10|1000|10000)$'";
+
+		expect(bashApproval(command, settingsOverrides)).toEqual({ tier: "write", policy: "allow" });
 	});
 
 	it("honors bash pattern rules in yolo mode", () => {

@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -10,6 +11,7 @@ import {
 	resolveTodoMarkdownPath,
 	selectCollapsedTodos,
 	TODO_STRIKE_HOLD_FRAMES,
+	TODO_STRIKE_TOTAL_FRAMES,
 	type TodoItem,
 	type TodoPhase,
 	TodoTool,
@@ -17,7 +19,6 @@ import {
 	todoToolRenderer,
 } from "@oh-my-pi/pi-coding-agent/tools";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { type } from "arktype";
 
 function createSession(initialPhases: TodoPhase[] = []): ToolSession {
 	let phases = initialPhases;
@@ -626,10 +627,13 @@ describe("todoToolRenderer.renderResult phase collapsing", () => {
 			task: "a1",
 		});
 		const rendered = Bun.stripANSI(component.render(100).join("\n"));
-		// Active phase's collapsed viewport omits the completed task and shows the
-		// promoted current one (#5873).
-		expect(rendered).not.toContain("a1");
+		// Active phase's collapsed viewport keeps the just-closed task as the lead
+		// row and shows the promoted current one (#5873), and its header carries
+		// progress so the phase being worked on is not the one phase with no
+		// completion signal.
+		expect(rendered).toContain("a1");
 		expect(rendered).toContain("a2");
+		expect(rendered).toContain("I. Alpha  1/2");
 		// Untouched phases collapse: headers + progress counts, no task contents.
 		expect(rendered).toContain("II. Beta");
 		expect(rendered).toContain("III. Gamma");
@@ -638,6 +642,24 @@ describe("todoToolRenderer.renderResult phase collapsing", () => {
 		expect(rendered).not.toContain("b2");
 		expect(rendered).not.toContain("c1");
 		expect(rendered).not.toContain("c2");
+	});
+	it("sweeps the just-completed row's strike in the collapsed view", async () => {
+		const result = await buildThreePhaseAfterDone();
+		// The card's default view is collapsed, so the completion animation the
+		// `completedTasks` plumbing drives has to land there — while the viewport
+		// dropped every closed row, the animation ran against a row nobody rendered.
+		const strikeSpan = (spinnerFrame: number): string => {
+			const rendered = todoToolRenderer
+				.renderResult(result, { expanded: false, isPartial: false, spinnerFrame }, theme, {
+					op: "done",
+					task: "a1",
+				})
+				.render(100)
+				.join("\n");
+			return /\x1b\[9m(.*?)\x1b\[29m/.exec(rendered)?.[1] ?? "";
+		};
+		expect(strikeSpan(0)).toBe("");
+		expect(strikeSpan(TODO_STRIKE_TOTAL_FRAMES)).toBe("a1");
 	});
 	it("falls back to in_progress / completed signals when call args are unavailable", async () => {
 		const result = await buildThreePhaseAfterDone();
@@ -696,7 +718,7 @@ describe("selectCollapsedTodos walking viewport (#5873)", () => {
 		expect(sel.summary).toContain("6 more todos");
 	});
 
-	it("omits completed and abandoned tasks in collapsed mode", () => {
+	it("leads with the last closed task and omits the rest in collapsed mode", () => {
 		const tasks: TodoItem[] = [
 			{ content: "done", status: "completed" },
 			{ content: "dropped", status: "abandoned" },
@@ -704,7 +726,27 @@ describe("selectCollapsedTodos walking viewport (#5873)", () => {
 			{ content: "next", status: "pending" },
 		];
 		const sel = selectCollapsedTodos(tasks, never, 5);
-		expect(contents(sel)).toEqual(["current", "next"]);
+		// One closed row survives so a completion is visible as it lands; earlier
+		// closed work stays hidden.
+		expect(contents(sel)).toEqual(["dropped", "current", "next"]);
+		expect(sel.summary).toBe("");
+	});
+
+	it("keeps an out-of-order completion as the closed lead row", () => {
+		const tasks: TodoItem[] = [
+			{ content: "current", status: "in_progress" },
+			{ content: "next", status: "pending" },
+			{ content: "finished early", status: "completed" },
+		];
+		const sel = selectCollapsedTodos(tasks, never, 5);
+		expect(contents(sel)).toEqual(["finished early", "current", "next"]);
+	});
+
+	it("keeps the closed lead row additive to the open-task cap", () => {
+		const tasks: TodoItem[] = [{ content: "closed", status: "completed" }, ...mk(5, [1])];
+		const sel = selectCollapsedTodos(tasks, never, 5);
+		// All 5 open tasks fit the cap; the closed context row does not evict one.
+		expect(contents(sel)).toEqual(["closed", "Task 1", "Task 2", "Task 3", "Task 4", "Task 5"]);
 		expect(sel.summary).toBe("");
 	});
 
@@ -811,5 +853,147 @@ describe("todoToolRenderer.renderCall malformed-args regression (#2005)", () => 
 		expect(rendered).toContain("append");
 		expect(rendered).toContain("Cleanup");
 		expect(rendered).toContain("1 item");
+	});
+});
+
+describe("todoToolRenderer.renderResult label sanitization", () => {
+	// A mirrored Cursor snapshot carries provider text verbatim into
+	// `details.phases`, and the renderer interpolates it straight into terminal
+	// output. A label holding ANSI/C0 sequences would rewrite the terminal every
+	// time the list renders or replays.
+	function renderPhases(phases: TodoPhase[]): string {
+		const result = {
+			content: [{ type: "text" as const, text: "1/1 tasks completed" }],
+			details: { phases, storage: "session" as const },
+			isError: false,
+		} as unknown as Parameters<typeof todoToolRenderer.renderResult>[0];
+		const component = todoToolRenderer.renderResult(result, { expanded: true, isPartial: false }, theme);
+		return component.render(120).join("\n");
+	}
+
+	it("strips control sequences from a mirrored task label", () => {
+		const hostile = "clear\u001b[2Jscreen\u0007bell";
+		const rendered = renderPhases([
+			{ name: "Execution", tasks: [{ content: hostile, status: "pending" }] },
+		] as unknown as TodoPhase[]);
+
+		// The dangerous bytes are gone; the readable text survives.
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(rendered).not.toContain("\u0007");
+		expect(Bun.stripANSI(rendered)).toContain("clear");
+		expect(Bun.stripANSI(rendered)).toContain("screen");
+	});
+
+	it("strips control sequences from a blocker note", () => {
+		const rendered = renderPhases([
+			{
+				name: "Execution",
+				tasks: [{ content: "ship it", status: "blocked", blocker: "waiting\u001b[2Jhere" }],
+			},
+		] as unknown as TodoPhase[]);
+
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(Bun.stripANSI(rendered)).toContain("waiting");
+	});
+
+	it("keeps a completed label intact under the strikethrough path", () => {
+		// The completed branch runs the label through `strikethroughText`, which
+		// splices per character — sanitizing first keeps that from interleaving
+		// styling with control bytes.
+		const rendered = renderPhases([
+			{ name: "Execution", tasks: [{ content: "done\u001b[2Jtask", status: "completed" }] },
+		] as unknown as TodoPhase[]);
+
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(Bun.stripANSI(rendered)).toContain("done");
+	});
+
+	it("strips control sequences from a phase header", () => {
+		// Multi-phase renders the header; single-phase omits it.
+		const rendered = renderPhases([
+			{ name: "Set\u001b[2Jup", tasks: [{ content: "a", status: "pending" }] },
+			{ name: "Ship", tasks: [{ content: "b", status: "pending" }] },
+		] as unknown as TodoPhase[]);
+
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(Bun.stripANSI(rendered)).toContain("Set");
+		expect(Bun.stripANSI(rendered)).toContain("up");
+	});
+
+	it("strips control sequences from the zero-task fallback text", () => {
+		// Cursor's own summary or refusal note lands here when nothing is mirrored.
+		const result = {
+			content: [{ type: "text" as const, text: "Todo\u001b[2Jsnapshot not mirrored" }],
+			details: { phases: [], storage: "session" as const },
+			isError: false,
+		} as unknown as Parameters<typeof todoToolRenderer.renderResult>[0];
+		const rendered = todoToolRenderer
+			.renderResult(result, { expanded: true, isPartial: false }, theme)
+			.render(120)
+			.join("\n");
+
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(Bun.stripANSI(rendered)).toContain("snapshot not mirrored");
+	});
+
+	it("flattens tabs in every result-side fragment", () => {
+		// `sanitizeText` deliberately preserves tabs, and a raw tab punches holes
+		// in bordered TUI output — so the display path must replace them too.
+		const rendered = renderPhases([
+			{ name: "Set\tup", tasks: [{ content: "ship\tit", status: "blocked", blocker: "waiting\there" }] },
+			{ name: "Ship", tasks: [{ content: "b", status: "pending" }] },
+		] as unknown as TodoPhase[]);
+
+		expect(rendered).not.toContain("\t");
+		expect(Bun.stripANSI(rendered)).toContain("ship");
+		expect(Bun.stripANSI(rendered)).toContain("waiting");
+		expect(Bun.stripANSI(rendered)).toContain("Set");
+	});
+
+	it("flattens tabs in the zero-task fallback text", () => {
+		const result = {
+			content: [{ type: "text" as const, text: "Todo\tsnapshot not mirrored" }],
+			details: { phases: [], storage: "session" as const },
+			isError: false,
+		} as unknown as Parameters<typeof todoToolRenderer.renderResult>[0];
+		const rendered = todoToolRenderer
+			.renderResult(result, { expanded: true, isPartial: false }, theme)
+			.render(120)
+			.join("\n");
+
+		expect(rendered).not.toContain("\t");
+		expect(Bun.stripANSI(rendered)).toContain("snapshot not mirrored");
+	});
+});
+
+describe("todoToolRenderer.renderCall preview sanitization", () => {
+	// The streaming preview interpolates partially-parsed, model-authored args
+	// straight into the status header. `renderStatusLine` only flattens CR/LF and
+	// leaves tabs to the caller, so control sequences and tabs must be handled
+	// here or a mid-stream delta rewrites the terminal.
+	function renderArgs(args: unknown): string {
+		const component = todoToolRenderer.renderCall(
+			args as Parameters<typeof todoToolRenderer.renderCall>[0],
+			{ expanded: false, isPartial: true, spinnerFrame: 0 },
+			theme,
+		);
+		return component.render(120).join("\n");
+	}
+
+	it("strips control sequences from the task and phase fragments", () => {
+		const rendered = renderArgs({ op: "done", task: "ship\u001b[2Jit", phase: "Exec\u0007ution" });
+
+		expect(rendered).not.toContain("\u001b[2J");
+		expect(rendered).not.toContain("\u0007");
+		expect(Bun.stripANSI(rendered)).toContain("ship");
+		expect(Bun.stripANSI(rendered)).toContain("Exec");
+	});
+
+	it("flattens tabs so a fragment cannot punch holes in the header", () => {
+		const rendered = renderArgs({ op: "done", task: "ship\tit" });
+
+		expect(rendered).not.toContain("\t");
+		expect(Bun.stripANSI(rendered)).toContain("ship");
+		expect(Bun.stripANSI(rendered)).toContain("it");
 	});
 });

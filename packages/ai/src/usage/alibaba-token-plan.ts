@@ -1,3 +1,4 @@
+import { toNumber } from "@oh-my-pi/pi-catalog/utils";
 import { parseAlibabaTokenPlanCredential } from "@oh-my-pi/pi-catalog/wire/alibaba-token-plan";
 import type {
 	CredentialRankingStrategy,
@@ -8,19 +9,25 @@ import type {
 	UsageReport,
 } from "../usage";
 import { isRecord } from "../utils";
-import { toNumber } from "./shared";
+import { HOUR_MS, parsePositiveTimestamp, WEEK_MS } from "./shared";
 
 const PROVIDER = "alibaba-token-plan";
 const CONSOLE_ORIGIN = "https://home.qwencloud.com";
 const DASHBOARD_URL = `${CONSOLE_ORIGIN}/billing/subscription/token-plan-individual`;
 const USER_INFO_URL = `${CONSOLE_ORIGIN}/tool/user/info.json`;
-const USAGE_URL = `${CONSOLE_ORIGIN}/data/api.json?product=sfm_bailian&action=IntlBroadScopeAspnGateway`;
 const GATEWAY_ACTION = "IntlBroadScopeAspnGateway";
 const USAGE_API = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage";
+const USAGE_URL = `https://cs-data.qwencloud.com/data/api.json?product=sfm_bailian&action=${GATEWAY_ACTION}&api=${encodeURIComponent(USAGE_API)}`;
 const BROWSER_USER_AGENT =
 	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
-const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const CONSOLE_CORNERSTONE_PARAM = {
+	domain: "home.qwencloud.com",
+	consoleSite: "QWENCLOUD",
+	console: "ONE_CONSOLE",
+	xsp_lang: "en-US",
+	protocol: "V2",
+	productCode: "p_efm",
+} as const;
 
 function extractCookieValue(header: string, name: string): string | undefined {
 	for (const segment of header.split(";")) {
@@ -32,10 +39,19 @@ function extractCookieValue(header: string, name: string): string | undefined {
 	return undefined;
 }
 
-function parseResetTime(value: unknown): number | undefined {
-	const parsed = toNumber(value);
-	if (parsed === undefined || parsed <= 0) return undefined;
-	return parsed < 1_000_000_000_000 ? parsed * 1000 : parsed;
+function unwrapGatewayData(value: Record<string, unknown>): Record<string, unknown> {
+	let current = value;
+	if (typeof current.Data === "string") {
+		try {
+			const parsed: unknown = JSON.parse(current.Data);
+			if (isRecord(parsed)) current = parsed;
+		} catch {
+			return current;
+		}
+	}
+	if (isRecord(current.DataV2) && isRecord(current.DataV2.data)) current = current.DataV2.data;
+	if (isRecord(current.data)) current = current.data;
+	return current;
 }
 
 function parseUsedFraction(value: unknown): number | undefined {
@@ -127,7 +143,11 @@ async function fetchAlibabaTokenPlanUsage(
 			action: GATEWAY_ACTION,
 			region: "ap-southeast-1",
 			sec_token: secToken,
-			params: JSON.stringify({ Api: USAGE_API, Data: {} }),
+			params: JSON.stringify({
+				Api: USAGE_API,
+				Data: { cornerstoneParam: CONSOLE_CORNERSTONE_PARAM },
+				V: "1.0",
+			}),
 		});
 		const usageResponse = await ctx.fetch(USAGE_URL, {
 			method: "POST",
@@ -145,22 +165,23 @@ async function fetchAlibabaTokenPlanUsage(
 			ctx.logger?.warn("QwenCloud usage response invalid", { provider: PROVIDER });
 			return null;
 		}
+		const responseData = unwrapGatewayData(payload.data);
 		const accountId = accountIdFromUserData(userPayload.data);
 		const limits = [
 			buildLimit(
 				"5h",
 				"5 Hour Credits",
-				FIVE_HOURS_MS,
-				parseUsedFraction(payload.data.per5HourPercentage),
-				parseResetTime(payload.data.per5HourResetTime),
+				5 * HOUR_MS,
+				parseUsedFraction(responseData.per5HourPercentage),
+				parsePositiveTimestamp(responseData.per5HourResetTime),
 				accountId,
 			),
 			buildLimit(
 				"7d",
 				"7 Day Credits",
-				SEVEN_DAYS_MS,
-				parseUsedFraction(payload.data.per1WeekPercentage),
-				parseResetTime(payload.data.per1WeekResetTime),
+				WEEK_MS,
+				parseUsedFraction(responseData.per1WeekPercentage),
+				parsePositiveTimestamp(responseData.per1WeekResetTime),
 				accountId,
 			),
 		].filter((limit): limit is UsageLimit => limit !== undefined);
@@ -196,7 +217,7 @@ export const alibabaTokenPlanRankingStrategy: CredentialRankingStrategy = {
 		secondary: report.limits.find(limit => limit.id === "credits:7d"),
 	}),
 	windowDefaults: {
-		primaryMs: FIVE_HOURS_MS,
-		secondaryMs: SEVEN_DAYS_MS,
+		primaryMs: 5 * HOUR_MS,
+		secondaryMs: WEEK_MS,
 	},
 };

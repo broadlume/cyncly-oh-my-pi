@@ -219,6 +219,30 @@ function truncateOutput(session: DapSession, output: string): void {
 	}
 }
 
+/**
+ * Drain a `runInTerminal` debuggee's stdout into the session output buffer.
+ *
+ * `ptree.spawn` always pipes stdout and only eagerly drains stderr; the exposed
+ * stdout stream must be consumed or Bun buffers it unboundedly in this process
+ * (a chatty debuggee grows omp toward OOM). The reverse-request path has no
+ * terminal surface here, so route the child's stdout through {@link
+ * truncateOutput}: this bounds memory at `MAX_OUTPUT_BYTES` and surfaces the
+ * program's output to the agent, mirroring the adapter's own `output` events.
+ * Runs in the background for the child's lifetime; a killed child or closed pipe
+ * ends the loop quietly.
+ */
+async function drainTerminalStdout(stream: ReadableStream<Uint8Array>, session: DapSession): Promise<void> {
+	const decoder = new TextDecoder();
+	try {
+		for await (const chunk of stream) {
+			truncateOutput(session, decoder.decode(chunk, { stream: true }));
+		}
+		truncateOutput(session, decoder.decode());
+	} catch {
+		// Child killed or pipe closed mid-stream; nothing more to surface.
+	}
+}
+
 function summarizeBreakpointCount(breakpoints: Map<string, DapBreakpointRecord[]>): number {
 	let total = 0;
 	for (const entries of breakpoints.values()) {
@@ -960,16 +984,50 @@ export class DapSessionManager {
 		signal?: AbortSignal,
 		timeoutMs: number = 30_000,
 	): Promise<{ snapshot: DapSessionSummary; threads: DapThread[] }> {
-		const session = this.#touchActiveSession();
-		const response = await this.#sendRequestWithConfig<DapThreadsResponse>(
-			session,
-			"threads",
-			undefined,
-			signal,
-			timeoutMs,
-		);
-		session.threads = response?.threads ?? [];
-		return { snapshot: buildSummary(session), threads: session.threads };
+		const anchor = this.#touchActiveSession();
+		// A js-debug launch is a session tree: the root may be a threadless
+		// launcher while each real thread lives in a child (main script,
+		// `[worker N]`, …), and other adapters keep every thread on the root.
+		// Querying only the active session would surface just one session's
+		// threads, so aggregate across the whole live tree. No topology guess:
+		// a threadless launcher simply returns no threads (or an error we skip).
+		const targets = this.#liveTreeSessions(anchor);
+		const merged: DapThread[] = [];
+		const seen = new Set<string>();
+		for (const target of targets) {
+			let threads: DapThread[];
+			try {
+				const response = await this.#sendRequestWithConfig<DapThreadsResponse>(
+					target,
+					"threads",
+					undefined,
+					signal,
+					timeoutMs,
+				);
+				threads = response?.threads ?? [];
+			} catch (error) {
+				// Caller cancellation is not an adapter failure: propagate it instead
+				// of degrading a cancelled call into a successful partial result.
+				if (signal?.aborted) throw error;
+				logger.warn("Failed to list threads for debug session", {
+					sessionId: target.id,
+					error: toErrorMessage(error),
+				});
+				continue;
+			}
+			target.threads = threads;
+			// DAP thread IDs are scoped per client session, so identical IDs from
+			// different sessions (e.g. two identical worker scripts) are distinct
+			// live threads and MUST be preserved; only collapse an exact repeat
+			// within a single session's response.
+			for (const thread of threads) {
+				const key = `${target.id}\0${thread.id}`;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				merged.push(thread);
+			}
+		}
+		return { snapshot: buildSummary(anchor), threads: merged };
 	}
 
 	async stackTrace(
@@ -1322,6 +1380,9 @@ export class DapSessionManager {
 				},
 				detached: true,
 			});
+			// Consume the child's stdout — ptree pipes it but drains only stderr,
+			// so an unconsumed stream buffers unboundedly in this process.
+			void drainTerminalStdout(proc.stdout, session);
 			return { processId: proc.pid } satisfies DapRunInTerminalResponse;
 		});
 		client.onReverseRequest("startDebugging", async rawArgs => {
@@ -1371,7 +1432,13 @@ export class DapSessionManager {
 		if (parentSessionId) {
 			this.#sessions.get(parentSessionId)?.childSessionIds.add(session.id);
 		}
-		this.#activeSessionId = session.id;
+		// Focus follows stops, not registrations: a lazily-attached child (e.g. a
+		// js-debug `[worker N]` session) must not steal focus from a sibling that
+		// is already stopped at a breakpoint / entry. Only claim focus when no
+		// live, stopped session currently holds it.
+		if (!this.#hasLiveStoppedActiveSession()) {
+			this.#activeSessionId = session.id;
+		}
 		const heartbeat = setInterval(() => {
 			if (!client.isAlive()) {
 				session.status = "terminated";
@@ -1696,6 +1763,12 @@ export class DapSessionManager {
 		return session;
 	}
 
+	/** True when the current active session is live and paused at a stop. */
+	#hasLiveStoppedActiveSession(): boolean {
+		const active = this.#getActiveSessionOrNull();
+		return active !== null && active.status === "stopped" && active.client.isAlive();
+	}
+
 	#getActiveSessionOrThrow(): DapSession {
 		const session = this.#getActiveSessionOrNull();
 		if (!session) {
@@ -1727,6 +1800,19 @@ export class DapSessionManager {
 			}
 		}
 		return sessions;
+	}
+
+	/**
+	 * Live (non-terminated, connected) sessions in `session`'s tree, or the
+	 * session itself when the tree has collapsed. Used to fan `threads` out
+	 * across the whole tree; a threadless session just reports no threads, so
+	 * this makes no assumption about which node owns them.
+	 */
+	#liveTreeSessions(session: DapSession): DapSession[] {
+		const live = this.#getTreeSessions(session).filter(
+			candidate => candidate.status !== "terminated" && candidate.client.isAlive(),
+		);
+		return live.length > 0 ? live : [session];
 	}
 
 	#touchSessionAndAncestors(session: DapSession): void {

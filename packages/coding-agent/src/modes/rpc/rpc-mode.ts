@@ -12,8 +12,8 @@
  */
 import { once } from "node:events";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
-import { isZodSchema, zodToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isRecord, readLines, Snowflake } from "@oh-my-pi/pi-utils";
+import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -32,11 +32,12 @@ import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
+import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
-import { claimRpcInput } from "./rpc-input";
+import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
@@ -603,6 +604,57 @@ export function requestRpcEditor(
 	} as RpcExtensionUIRequest);
 	return promise;
 }
+
+/** Sends an RPC extension dialog and cancels the remote presentation when its signal aborts. */
+export function requestRpcDialog<T>(
+	pendingRequests: Map<string, PendingExtensionRequest>,
+	output: RpcOutput,
+	opts: ExtensionUIDialogOptions | undefined,
+	defaultValue: T,
+	request: Record<string, unknown>,
+	parseResponse: (response: RpcExtensionUIResponse) => T,
+): Promise<T> {
+	if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+
+	const id = Snowflake.next() as string;
+	const { promise, resolve, reject } = Promise.withResolvers<T>();
+	let timeoutId: NodeJS.Timeout | undefined;
+
+	const cleanup = () => {
+		clearTimeout(timeoutId);
+		opts?.signal?.removeEventListener("abort", onAbort);
+		pendingRequests.delete(id);
+	};
+	const onAbort = () => {
+		output({
+			type: "extension_ui_request",
+			id: Snowflake.next() as string,
+			method: "cancel",
+			targetId: id,
+		} as RpcExtensionUIRequest);
+		cleanup();
+		resolve(defaultValue);
+	};
+	opts?.signal?.addEventListener("abort", onAbort, { once: true });
+
+	if (opts?.timeout !== undefined) {
+		timeoutId = setTimeout(() => {
+			opts.onTimeout?.();
+			cleanup();
+			resolve(defaultValue);
+		}, opts.timeout);
+	}
+
+	pendingRequests.set(id, {
+		resolve: response => {
+			cleanup();
+			resolve(parseResponse(response));
+		},
+		reject,
+	});
+	output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
+	return promise;
+}
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -685,56 +737,14 @@ export async function runRpcMode(
 			private output: (obj: RpcResponse | RpcExtensionUIRequest | object) => void,
 		) {}
 
-		/** Helper for dialog methods with signal/timeout support */
-		#createDialogPromise<T>(
-			opts: ExtensionUIDialogOptions | undefined,
-			defaultValue: T,
-			request: Record<string, unknown>,
-			parseResponse: (response: RpcExtensionUIResponse) => T,
-		): Promise<T> {
-			if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
-
-			const id = Snowflake.next() as string;
-			const { promise, resolve, reject } = Promise.withResolvers<T>();
-			let timeoutId: NodeJS.Timeout | undefined;
-
-			const cleanup = () => {
-				if (timeoutId) clearTimeout(timeoutId);
-				opts?.signal?.removeEventListener("abort", onAbort);
-				this.pendingRequests.delete(id);
-			};
-
-			const onAbort = () => {
-				cleanup();
-				resolve(defaultValue);
-			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-
-			if (opts?.timeout !== undefined) {
-				timeoutId = setTimeout(() => {
-					opts.onTimeout?.();
-					cleanup();
-					resolve(defaultValue);
-				}, opts.timeout);
-			}
-
-			this.pendingRequests.set(id, {
-				resolve: (response: RpcExtensionUIResponse) => {
-					cleanup();
-					resolve(parseResponse(response));
-				},
-				reject,
-			});
-			this.output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
-			return promise;
-		}
-
 		select(
 			title: string,
 			options: ExtensionUISelectItem[],
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				undefined,
 				{
@@ -748,7 +758,9 @@ export async function runRpcMode(
 		}
 
 		confirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				false,
 				{ method: "confirm", title, message, timeout: dialogOptions?.timeout },
@@ -768,7 +780,9 @@ export async function runRpcMode(
 			placeholder?: string,
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return this.#createDialogPromise(
+			return requestRpcDialog(
+				this.pendingRequests,
+				this.output,
 				dialogOptions,
 				undefined,
 				{ method: "input", title, placeholder, timeout: dialogOptions?.timeout },
@@ -919,6 +933,7 @@ export async function runRpcMode(
 
 	// Set up extensions with RPC-based UI context
 	await initializeExtensions(session, {
+		mode: "rpc",
 		reportSendError: (action, err) => {
 			output(error(undefined, action, err.message));
 		},
@@ -1071,19 +1086,33 @@ export async function runRpcMode(
 					sessionId: session.sessionId,
 					sessionName: session.sessionName,
 					autoCompactionEnabled: session.autoCompactionEnabled,
-					messageCount: session.messages.length,
 					queuedMessageCount: session.queuedMessageCount,
 					todoPhases: session.getTodoPhases(),
+					fastModeEnabled: session.isFastModeEnabled(),
+					tokensPerSecond: calculateTokensPerSecond(session.messages, session.isStreaming),
+					fastModeActive: session.isFastModeActive(),
+					messageCount: session.messages.length,
 					systemPrompt: session.systemPrompt,
 					dumpTools: session.agent.state.tools.map(tool => ({
 						name: tool.name,
 						description: tool.description,
-						parameters: isZodSchema(tool.parameters) ? zodToWireSchema(tool.parameters) : tool.parameters,
+						parameters: toolWireSchema(tool),
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
 				};
 				return success(id, "get_state", state);
+			}
+
+			case "set_fast_mode": {
+				const supported = session.setFastMode(command.enabled);
+				if (command.enabled && !supported) {
+					return error(id, "set_fast_mode", "Fast mode is unavailable for the current model.");
+				}
+				return success(id, "set_fast_mode", {
+					enabled: session.isFastModeEnabled(),
+					active: session.isFastModeActive(),
+				});
 			}
 
 			case "get_available_commands": {
@@ -1456,23 +1485,14 @@ export async function runRpcMode(
 	// Keep the stdin reader moving: side-channel frames dispatch immediately,
 	// ordinary commands serialize through inputDispatcher, and bash remains
 	// background-dispatched so abort_bash can overtake it. Frames are read
-	// line-by-line and parsed here (not via readJsonl) so a single malformed
-	// line is reported as an error frame and the loop keeps running instead of
-	// throwing out of the generator and killing the whole process (issue #5194).
-	const decoder = new TextDecoder();
-	for await (const line of readLines(input ?? Bun.stdin.stream())) {
-		const text = decoder.decode(line).trim();
-		if (!text) continue;
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(text);
-		} catch (e: unknown) {
-			const message = e instanceof Error ? e.message : String(e);
-			output(error(undefined, "parse", `Failed to parse command: ${message}`));
-			continue;
-		}
-		inputDispatcher.dispatch(parsed);
-	}
+	// line-by-line by readRpcInputFrames so a single malformed line is reported
+	// as an error frame and the loop keeps running instead of throwing out of
+	// the reader and killing the whole process (issue #5194).
+	await readRpcInputFrames(
+		input ?? Bun.stdin.stream(),
+		parsed => inputDispatcher.dispatch(parsed),
+		message => output(error(undefined, "parse", message)),
+	);
 
 	// stdin closed — RPC client is gone. Fail pending side-channel requests
 	// first so active/queued commands can settle, then drain accepted work.

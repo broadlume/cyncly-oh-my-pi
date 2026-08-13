@@ -3,16 +3,16 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { formatHashlineHeader, stripHashlinePrefixes } from "@oh-my-pi/hashline";
+import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentTool,
 	AgentToolContext,
 	AgentToolResult,
 	AgentToolUpdateCallback,
-	ToolTier,
+	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 
 import { canonicalSnapshotKey, getFileSnapshotStore } from "../edit/file-snapshot-store";
 import { normalizeToLF } from "../edit/normalize";
@@ -88,7 +88,14 @@ import {
 } from "./sqlite-reader";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
-import { renderXdevCall, renderXdevResult, type XdevDispatch } from "./xdev";
+import {
+	dispatchXdevTool,
+	renderXdevCall,
+	renderXdevResult,
+	resolveXdevTool,
+	type XdevDispatch,
+	xdevListing,
+} from "./xdev";
 
 const LOOSE_HASHLINE_HEADER_RE = /^\s*\[[^#\r\n]+#[^ \t\r\n]*\]\s*$/;
 const EXECUTABLE_NOTICE = "[Notice: Made executable via chmod +x]";
@@ -153,7 +160,42 @@ function throwReadSelectorMisfire(target: string, sel: string): never {
 	);
 }
 
+/**
+ * Recognize a semicolon-joined list of read-tool selectors mis-dispatched as a
+ * single write target — the multi-file read expression the scout emitted in
+ * issue #6809 (`a.txt:1-2;b/c.txt:3-4`). Every `;`-segment must be non-empty and
+ * carry its own read selector ({@link splitPathAndSel} peels a `:N-M`, `:raw`,
+ * or `:conflicts` tail). No real call targets such a list: `read` accepts one
+ * path, `write` writes one file. Unlike {@link readSelectorForEmptyWrite} this
+ * fires regardless of `content` — the non-empty-content escape hatch exists for
+ * a lone selector-shaped *filename*, never a `;`-list, and honoring it here
+ * silently creates a nested directory tree (`a.txt:1-2;b/`) in the workspace.
+ * The caller still probes the literal target first, so an existing POSIX file
+ * by that exact name stays writable (same escape as the single-selector guard).
+ */
+function readSelectorListMisfire(target: string): number | undefined {
+	if (!target.includes(";")) return undefined;
+	const segments = target.split(";");
+	if (segments.length < 2) return undefined;
+	for (const segment of segments) {
+		const trimmed = segment.trim();
+		if (trimmed.length === 0 || splitPathAndSel(trimmed).sel === undefined) return undefined;
+	}
+	return segments.length;
+}
+
+function throwReadSelectorListMisfire(target: string, count: number): never {
+	throw new ToolError(
+		`write target '${target}' is a semicolon-joined list of ${count} read-tool selectors, not a filesystem path — refusing to create it. ` +
+			`write creates a single file; issue one read() per path to read these ranges (e.g. read({ path: "<one path>:<range>" })).`,
+	);
+}
+
 async function assertNotReadSelectorMisfire(target: string, content: string, cwd: string): Promise<void> {
+	const listCount = readSelectorListMisfire(target);
+	if (listCount !== undefined && (await probeLiteralPathExists(target, cwd)) === "missing") {
+		throwReadSelectorListMisfire(target, listCount);
+	}
 	const sel = readSelectorForEmptyWrite(target, content);
 	if (sel === undefined) return;
 	if ((await probeLiteralPathExists(target, cwd)) !== "missing") return;
@@ -458,7 +500,7 @@ function parseSqliteWriteTarget(subPath: string, queryString: string): { table: 
  */
 export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails> {
 	readonly name = "write";
-	readonly approval = (args: unknown): ToolTier => {
+	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const rawPath = (args as Partial<WriteParams>).path;
 		if (typeof rawPath !== "string") return "write";
 		// Unwrap a hashline `[path#TAG]` wrapper first (parity with execute) so a
@@ -471,7 +513,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		if (xdevTarget) {
 			if (xdevTarget.name === REPORT_ISSUE_DEVICE_NAME) return "write";
 			if (xdevTarget.name && isResolutionDeviceName(xdevTarget.name)) return "read";
-			const inst = xdevTarget.name ? this.session.xdevRegistry?.get(xdevTarget.name) : undefined;
+			const inst =
+				xdevTarget.name && this.session.xdev ? resolveXdevTool(this.session.xdev, xdevTarget.name) : undefined;
 			if (!inst) return "exec";
 			// Decode the device JSON payload and evaluate the mounted tool's own
 			// approval (which may be argument-dependent, e.g. ast_edit is read-tier
@@ -489,7 +532,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			}
 			if (!isRecord(parsed)) return "exec";
 			try {
-				return resolveToolTier(inst, parsed);
+				// The tier is the mounted tool's own (argument-dependent) approval; the
+				// policyKey makes the outer gate consult `tools.approval.<device>` for
+				// this dispatch before falling back to `tools.approval.write`, so users
+				// can scope allow/deny/prompt to a single device (issue #7923).
+				return { tier: resolveToolTier(inst, parsed), policyKey: xdevTarget.name! };
 			} catch {
 				return "exec";
 			}
@@ -612,7 +659,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const entries = new Map<string, ArchiveMemberContent>();
 		if (resolvedArchivePath.exists) {
 			try {
-				const existing = await readArchiveEntries({ bytes: await Bun.file(finalPath).bytes(), format });
+				const existing = await readArchiveEntries({ path: finalPath, format });
 				for (const [entryPath, data] of existing) {
 					entries.set(entryPath, data);
 				}
@@ -1104,14 +1151,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 									};
 									return;
 								}
-								const registry = this.session.xdevRegistry;
-								if (!registry || registry.size === 0) {
+								const xdev = this.session.xdev;
+								if (!xdev) {
 									throw new ToolError("xd:// is not mounted in this session.");
 								}
 								if (!name) {
-									throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${registry.listing()}`);
+									throw new ToolError(`Cannot write to xd:// itself — pick a device:\n${xdevListing(xdev)}`);
 								}
-								const { result, xdev } = await registry.dispatch(
+								const { result, xdev: dispatch } = await dispatchXdevTool(
+									xdev,
 									name,
 									deviceContent,
 									_toolCallId,
@@ -1124,7 +1172,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 								);
 								xdResult = {
 									content: result.content,
-									details: { xdev },
+									details: { xdev: dispatch },
 									isError: result.isError,
 									useless: result.useless,
 								};
@@ -1215,7 +1263,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			// Check if file exists and is auto-generated before overwriting
 			if (await fs.exists(absolutePath)) {
-				await assertEditableFile(absolutePath, path);
+				await assertEditableFile(absolutePath, path, this.session.settings);
 			}
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
@@ -1223,9 +1271,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			// Try ACP bridge first for editor-visible filesystem paths. Internal
 			// artifacts such as local:// plans are owned by OMP, not the editor.
-			if (await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent, signal)) {
-				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, cleanContent);
-				const header = maybeWriteSnapshotHeader(this.session, absolutePath, cleanContent);
+			const bridgeWrite = await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent, signal);
+			if (bridgeWrite) {
+				// `write` always replaces the whole file, so (unlike hashline's
+				// hunk-scoped diff) there's no size cost to keying the header/
+				// executable-bit check on the verified post-write content —
+				// use it so a drifted write (e.g. client format-on-save) still
+				// hands back a tag that matches what's actually on disk.
+				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, bridgeWrite.text);
+				const header = maybeWriteSnapshotHeader(this.session, absolutePath, bridgeWrite.text);
 				const writeLine = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
 				let resultText = header ? `${header}\n${writeLine}` : writeLine;
 				if (stripped) {
@@ -1347,6 +1401,82 @@ function normalizeDisplayText(text: unknown): string {
  */
 const WRITE_GUTTER_MIN_WIDTH = 3;
 
+/**
+ * Per-component streaming line index for {@link formatStreamingContent}.
+ * Keyed on the ToolExecutionComponent's persistent render-state object (the
+ * `options` argument renderers receive on every rebuild), so the entry lives
+ * exactly as long as the component and never leaks across tool calls.
+ *
+ * Why: streamed write content is append-only, but the formatter used to
+ * normalize + `split("\n")` the ENTIRE accumulated payload on every reveal
+ * tick — O(n) per tick, O(n²) per stream, which was a measurable main-thread
+ * stall on long writes (and multiplied across concurrent subagent writes).
+ * Tracking the newline count incrementally and extracting only the tail
+ * window makes each tick O(delta + preview lines).
+ */
+interface WriteStreamingLineIndex {
+	/** Number of content code units scanned so far. */
+	length: number;
+	/** Bounded suffix used to detect a restarted/non-append stream. */
+	suffix: string;
+	/** `1 + count("\n")` over the scanned content. */
+	lineCount: number;
+}
+
+const writeStreamingLineIndex = new WeakMap<object, WriteStreamingLineIndex>();
+
+/** Keep append validation constant-time instead of comparing the entire prior payload. */
+const WRITE_STREAMING_APPEND_GUARD_LENGTH = 64;
+
+/** Total logical line count of `content`, resuming from the cached prefix scan when append-only. */
+function streamingTotalLines(streamKey: object | undefined, content: string): number {
+	if (streamKey === undefined) {
+		let lines = 1;
+		for (let i = 0; i < content.length; i++) if (content.charCodeAt(i) === 10) lines++;
+		return lines;
+	}
+	let entry = writeStreamingLineIndex.get(streamKey);
+	const continuesPrevious =
+		entry !== undefined &&
+		content.length >= entry.length &&
+		content.startsWith(entry.suffix, entry.length - entry.suffix.length);
+	if (entry !== undefined && continuesPrevious) {
+		let lines = entry.lineCount;
+		for (let i = entry.length; i < content.length; i++) if (content.charCodeAt(i) === 10) lines++;
+		entry.length = content.length;
+		entry.suffix = content.slice(-WRITE_STREAMING_APPEND_GUARD_LENGTH);
+		entry.lineCount = lines;
+		return lines;
+	}
+	let lines = 1;
+	for (let i = 0; i < content.length; i++) if (content.charCodeAt(i) === 10) lines++;
+	entry = {
+		length: content.length,
+		suffix: content.slice(-WRITE_STREAMING_APPEND_GUARD_LENGTH),
+		lineCount: lines,
+	};
+	writeStreamingLineIndex.set(streamKey, entry);
+	return lines;
+}
+
+/**
+ * Raw offset just after the (totalLines - previewLines)-th newline — i.e. the
+ * start of the last `previewLines` logical lines — scanning back from the end.
+ * Returns 0 when the whole content fits in the window. Equivalent to
+ * `content.split("\n").slice(-previewLines).join("\n")` without materializing
+ * the full line array.
+ */
+function tailWindowStart(content: string, previewLines: number): number {
+	let newlinesSeen = 0;
+	for (let i = content.length - 1; i >= 0; i--) {
+		if (content.charCodeAt(i) === 10) {
+			newlinesSeen++;
+			if (newlinesSeen === previewLines) return i + 1;
+		}
+	}
+	return 0;
+}
+
 function formatStreamingContent(
 	content: string,
 	expanded: boolean,
@@ -1354,19 +1484,32 @@ function formatStreamingContent(
 	uiTheme: Theme,
 	spinnerFrame?: number,
 	cache?: RenderedStringCache,
+	streamKey?: object,
 ): string {
 	if (!content) return "";
 	const bodyText = cachedRenderedString(cache, uiTheme, expanded, language ?? "", content, () => {
-		const lines = normalizeDisplayText(content).split("\n");
-		const totalLines = lines.length;
 		// Collapsed: follow the streaming edge with a bounded tail window so the box
 		// stays short enough not to strand its scrolled-off head above the viewport
 		// while the block is volatile. `Ctrl+O` (expanded) lifts the cap for a
 		// deliberate full view — matching the eval streaming preview.
-		const startIndex = expanded ? 0 : Math.max(0, totalLines - WRITE_STREAMING_PREVIEW_LINES);
-		const visibleLines = lines.slice(startIndex);
+		let totalLines: number;
+		let startIndex: number;
+		let visibleText: string;
+		if (expanded) {
+			visibleText = normalizeDisplayText(content);
+			totalLines = 1;
+			for (let i = 0; i < visibleText.length; i++) if (visibleText.charCodeAt(i) === 10) totalLines++;
+			startIndex = 0;
+		} else {
+			totalLines = streamingTotalLines(streamKey, content);
+			startIndex = Math.max(0, totalLines - WRITE_STREAMING_PREVIEW_LINES);
+			const tail =
+				startIndex === 0 ? content : content.slice(tailWindowStart(content, WRITE_STREAMING_PREVIEW_LINES));
+			visibleText = tail.replace(/\r/g, "");
+		}
+		if (visibleText.length === 0) return "";
 		const hidden = startIndex;
-		const highlighted = highlightCode(visibleLines.join("\n"), language);
+		const highlighted = highlightCode(visibleText, language);
 		const lineNumberWidth = Math.max(WRITE_GUTTER_MIN_WIDTH, String(totalLines).length);
 
 		let text = "\n\n";
@@ -1381,6 +1524,7 @@ function formatStreamingContent(
 		}
 		return text;
 	});
+	if (bodyText.length === 0) return "";
 	// The animated glyph lives on this trailing line — inside the transcript's
 	// volatile-tail holdback — never in the header: an animating head row pins
 	// the native-scrollback commit boundary at the top of the block, so a long
@@ -1464,7 +1608,12 @@ export const writeToolRenderer = {
 			},
 			uiTheme,
 		);
-		const content = normalizeDisplayText(args.content);
+		// Raw content, not normalizeDisplayText(args.content): the collapsed
+		// streaming path normalizes only its tail window, so a full-payload
+		// normalize on every reveal tick would re-introduce the O(n²) streaming
+		// cost formatStreamingContent avoids. Non-string content still falls
+		// back to the normalizing stringify.
+		const content = typeof args.content === "string" ? args.content : normalizeDisplayText(args.content);
 		const streamingCache = createRenderedStringCache();
 		return framedBlock(uiTheme, width => {
 			const body = content
@@ -1475,6 +1624,10 @@ export const writeToolRenderer = {
 						uiTheme,
 						options?.spinnerFrame,
 						streamingCache,
+						// `options` is the ToolExecutionComponent's persistent
+						// render-state object — a stable identity across reveal ticks
+						// that keys the incremental line index.
+						options,
 					)
 				: "";
 			const bodyLines = body ? body.split("\n") : [];

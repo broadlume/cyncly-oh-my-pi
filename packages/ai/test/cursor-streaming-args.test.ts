@@ -58,6 +58,7 @@ function newHarness(): Harness {
 		get currentToolCall() {
 			return toolCall;
 		},
+		openToolCalls: new Map(),
 		resolvedMcpToolCallIds: new Set(),
 		firstTokenTime: undefined,
 		setTextBlock: b => {
@@ -182,6 +183,26 @@ describe("Cursor MCP exec resolution", () => {
 
 		const block = h.output.content[0] as ToolCallState;
 		expect(block[kCursorExecResolved]).toBe(true);
+		expect(h.state.resolvedMcpToolCallIds.size).toBe(0);
+	});
+
+	it("does not duplicate an MCP call synthesized from an earlier exec frame", () => {
+		const h = newHarness();
+		synthesizeCursorExecToolCall(h.output, h.stream, h.state, "call-resolved", "web_search", {
+			query: "latest chess news",
+		});
+		h.state.resolvedMcpToolCallIds.add("call-resolved");
+
+		startMcpToolCall(h, "web_search", "call-resolved");
+
+		expect(h.output.content).toHaveLength(1);
+		expect(h.output.content[0]).toMatchObject({
+			type: "toolCall",
+			id: "call-resolved",
+			name: "web_search",
+			arguments: { query: "latest chess news" },
+		});
+		expect(h.captured.map(event => event.type)).toEqual(["toolcall_start", "toolcall_end"]);
 		expect(h.state.resolvedMcpToolCallIds.size).toBe(0);
 	});
 });
@@ -391,9 +412,42 @@ describe("synthesizeCursorExecToolCall (issue #4348)", () => {
 			type: "toolCall",
 			id: "t2",
 			name: "bash",
-			arguments: { command: "echo hi", cwd: undefined, timeout: undefined },
+			// Undefined optional kwargs are dropped so ArkType optional-field
+			// validation does not reject the synthesized block.
+			arguments: { command: "echo hi" },
 		});
 		expect(t3).toMatchObject({ type: "text", text: "done" });
+	});
+
+	it("omits undefined optional kwargs from synthesized exec tool args", () => {
+		const h = newHarness();
+		synthesizeCursorExecToolCall(h.output, h.stream, h.state, "bash-1", "bash", {
+			command: "pwd",
+			cwd: undefined,
+			timeout: 30,
+		});
+		synthesizeCursorExecToolCall(h.output, h.stream, h.state, "grep-1", "grep", {
+			pattern: "needle",
+			path: ".",
+			case: undefined,
+			skip: undefined,
+		});
+		const [bashCall, grepCall] = h.output.content;
+		expect(bashCall).toMatchObject({
+			type: "toolCall",
+			id: "bash-1",
+			name: "bash",
+			arguments: { command: "pwd", timeout: 30 },
+		});
+		expect(Object.hasOwn((bashCall as { arguments: object }).arguments, "cwd")).toBe(false);
+		expect(grepCall).toMatchObject({
+			type: "toolCall",
+			id: "grep-1",
+			name: "grep",
+			arguments: { pattern: "needle", path: "." },
+		});
+		expect(Object.hasOwn((grepCall as { arguments: object }).arguments, "case")).toBe(false);
+		expect(Object.hasOwn((grepCall as { arguments: object }).arguments, "skip")).toBe(false);
 	});
 
 	it("emits toolcall events at the exact index the block occupies in content", () => {

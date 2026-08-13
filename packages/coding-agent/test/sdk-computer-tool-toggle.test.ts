@@ -28,6 +28,7 @@ describe("AgentSession.setComputerToolEnabled", () => {
 		registryDir = path.join(os.tmpdir(), `pi-computer-toggle-${Snowflake.next()}`);
 		fs.mkdirSync(registryDir, { recursive: true });
 		authStorage = await AuthStorage.create(path.join(registryDir, "auth.db"));
+		authStorage.setRuntimeApiKey("google", "test-key");
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
@@ -47,6 +48,13 @@ describe("AgentSession.setComputerToolEnabled", () => {
 			settings,
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
 		});
 		sessions.push(session);
 
@@ -70,6 +78,14 @@ describe("AgentSession.setComputerToolEnabled", () => {
 
 		// Re-enable reuses the retained registry entry.
 		expect(await session.setComputerToolEnabled(true)).toBe(true);
+		session.settings.override("computer.enabled", true);
+		expect(session.getEnabledToolNames()).toContain("computer");
+
+		const gemini = getBundledModel("google", "gemini-2.5-flash");
+		if (!gemini) throw new Error("Expected bundled Google Gemini model to exist");
+		await session.setModel(gemini);
+		expect(session.model).toBe(gemini);
+		expect(session.settings.get("computer.enabled")).toBe(true);
 		expect(session.getEnabledToolNames()).toContain("computer");
 	});
 });

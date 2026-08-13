@@ -74,6 +74,8 @@ function normalizeServerConfig(name: string, config: RawServerConfig): ServerCon
 	const fileTypes =
 		normalizeStringArray(config.fileTypes) ?? normalizeExtensionToFileTypes(config.extensionToLanguage);
 	const rootMarkers = normalizeStringArray(config.rootMarkers) ?? (config.extensionToLanguage ? ["."] : null);
+	const languageId =
+		typeof config.languageId === "string" && config.languageId.length > 0 ? config.languageId : undefined;
 
 	if (!command || !fileTypes || !rootMarkers) {
 		logger.warn("Ignoring invalid LSP server config (missing required fields).", { name });
@@ -95,6 +97,7 @@ function normalizeServerConfig(name: string, config: RawServerConfig): ServerCon
 		args,
 		fileTypes,
 		rootMarkers,
+		languageId,
 		...(initOptions ? { initOptions } : {}),
 	};
 }
@@ -226,6 +229,7 @@ export function hasRootMarkerAncestor(filePath: string, markers: string[]): bool
  */
 const PYTHON_ROOT_MARKERS = [
 	"pyproject.toml",
+	"ty.toml",
 	"requirements.txt",
 	"setup.py",
 	"setup.cfg",
@@ -423,6 +427,7 @@ function getConfigSources(cwd: string): ConfigSource[] {
  *       "command": "/path/to/server",
  *       "args": ["--stdio"],
  *       "fileTypes": [".xyz"],
+ *       "languageId": "xyz",
  *       "rootMarkers": [".xyz-project"]
  *     }
  *   }

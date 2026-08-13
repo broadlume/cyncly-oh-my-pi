@@ -6,8 +6,8 @@ import {
 	midPromptSkillTokenMatches,
 } from "../autocomplete";
 import { BracketedPasteHandler, decodeReencodedPasteControls } from "../bracketed-paste";
-import { getKeybindings, type KeybindingsManager } from "../keybindings";
-import { extractPrintableText, matchesKey } from "../keys";
+import { canonicalKeyId, getKeybindings, type KeybindingsManager } from "../keybindings";
+import { extractPrintableText, matchesKey, parseKey } from "../keys";
 import { KillRing } from "../kill-ring";
 import type { SymbolTheme } from "../symbols";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
@@ -341,6 +341,17 @@ function maxSegmentVisualCol(text: string, isLastSegment: boolean): number {
 	return isLastSegment ? total : Math.max(0, total - lastWidth);
 }
 
+/** True when every code unit is plain printable text: no C0 controls (so no
+ *  ESC/CR/LF/TAB), no DEL, no C1 range — the same set `extractPrintableText`
+ *  rejects. Such a run can never encode a key sequence. */
+function isPlainTextRun(data: string): boolean {
+	for (let i = 0; i < data.length; i++) {
+		const code = data.charCodeAt(i);
+		if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) return false;
+	}
+	return true;
+}
+
 const DEFAULT_PAGE_SCROLL_LINES = 10;
 
 const MAX_UNDO_STACK = 100;
@@ -380,6 +391,8 @@ export interface EditorTopBorder {
 	content: string;
 	/** Visible width of the content */
 	width: number;
+	/** Optional logical revision that changes independently of available width. */
+	revision?: number;
 }
 
 interface HistoryEntry {
@@ -399,6 +412,8 @@ export class Editor implements Component, Focusable {
 		cursorLine: 0,
 		cursorCol: 0,
 	};
+	#widthEpochText = "";
+	#widthEpochRevision = 0;
 
 	/** Focusable interface - set by TUI when focus changes */
 	focused: boolean = false;
@@ -504,6 +519,9 @@ export class Editor implements Component, Focusable {
 	// per-event rebuilds down to one per rendered frame (see #4145).
 	#topBorderContent?: EditorTopBorder;
 	#topBorderProvider?: (availableWidth: number) => EditorTopBorder | undefined;
+	#topBorderProviderWidth: number | undefined;
+	#topBorderProviderSignature: string | undefined;
+	#topBorderProviderRevision: number | undefined;
 	#borderVisible = true;
 
 	constructor(theme: EditorTheme) {
@@ -525,7 +543,10 @@ export class Editor implements Component, Focusable {
 	 * per-event rebuilds to one per painted frame.
 	 */
 	setTopBorder(content: EditorTopBorder | undefined): void {
+		if (this.#topBorderContent?.content === content?.content && this.#topBorderContent?.width === content?.width)
+			return;
 		this.#topBorderContent = content;
+		this.#widthEpochRevision++;
 	}
 
 	/**
@@ -535,18 +556,26 @@ export class Editor implements Component, Focusable {
 	 *
 	 * Use this when the top border derives from state that mutates far faster
 	 * than the render cadence (session events, streaming, subagent updates).
-	 * The TUI already throttles renders, so a provider is invoked at most once
-	 * per frame and never does wasted work between paints.
+	 * The TUI already throttles renders, so a provider is invoked exactly once
+	 * per frame and does no work between paints. Return a logical `revision` to
+	 * distinguish concurrent status mutations from pure width reflow.
 	 */
 	setTopBorderProvider(provider: ((availableWidth: number) => EditorTopBorder | undefined) | undefined): void {
+		if (this.#topBorderProvider === provider) return;
 		this.#topBorderProvider = provider;
+		this.#topBorderProviderWidth = undefined;
+		this.#topBorderProviderSignature = undefined;
+		this.#topBorderProviderRevision = undefined;
+		this.#widthEpochRevision++;
 	}
 
 	/**
 	 * Show or hide the editor border chrome.
 	 */
 	setBorderVisible(borderVisible: boolean): void {
+		if (this.#borderVisible === borderVisible) return;
 		this.#borderVisible = borderVisible;
+		this.#widthEpochRevision++;
 	}
 
 	setPromptGutter(promptGutter: string | undefined): void {
@@ -567,12 +596,16 @@ export class Editor implements Component, Focusable {
 	 * Use the real terminal cursor instead of rendering a cursor glyph.
 	 */
 	setUseTerminalCursor(useTerminalCursor: boolean): void {
+		if (this.#useTerminalCursor === useTerminalCursor) return;
 		this.#useTerminalCursor = useTerminalCursor;
+		this.#widthEpochRevision++;
 	}
 
 	/** Render a dedicated bottom border so terminal-local IME preedit cannot shift editor chrome. */
 	setImeSafeCursorLayout(enabled: boolean): void {
+		if (this.#imeSafeCursorLayout === enabled) return;
 		this.#imeSafeCursorLayout = enabled;
+		this.#widthEpochRevision++;
 	}
 
 	getUseTerminalCursor(): boolean {
@@ -582,6 +615,7 @@ export class Editor implements Component, Focusable {
 	setMaxHeight(maxHeight: number | undefined): void {
 		if (this.#maxHeight === maxHeight) return;
 		this.#maxHeight = maxHeight;
+		this.#widthEpochRevision++;
 		// Don't reset scrollOffset — #updateScrollOffset will clamp it on next render
 	}
 
@@ -602,6 +636,10 @@ export class Editor implements Component, Focusable {
 		const newMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
 		if (this.#autocompleteMaxVisible !== newMaxVisible) {
 			this.#autocompleteMaxVisible = newMaxVisible;
+			if (this.#autocompleteState !== null) {
+				this.#autocompleteList?.setMaxVisible(newMaxVisible);
+				this.#widthEpochRevision++;
+			}
 		}
 	}
 
@@ -889,7 +927,27 @@ export class Editor implements Component, Focusable {
 			// Provider (lazy) wins over eager content — a host that installs both
 			// wants the coalesced path; falling back to eager keeps existing
 			// setTopBorder callers working unchanged.
-			const topBorder = this.#topBorderProvider ? this.#topBorderProvider(topFillWidth) : this.#topBorderContent;
+			let topBorder: EditorTopBorder | undefined;
+			if (this.#topBorderProvider) {
+				const previousWidth = this.#topBorderProviderWidth;
+				topBorder = this.#topBorderProvider(topFillWidth);
+				const signature = topBorder ? `${topBorder.width}\0${topBorder.content}` : "";
+				const revision = topBorder?.revision;
+				if (
+					(previousWidth !== undefined &&
+						revision !== undefined &&
+						this.#topBorderProviderRevision !== undefined &&
+						revision !== this.#topBorderProviderRevision) ||
+					(previousWidth === topFillWidth && signature !== this.#topBorderProviderSignature)
+				) {
+					this.#widthEpochRevision++;
+				}
+				this.#topBorderProviderWidth = topFillWidth;
+				this.#topBorderProviderSignature = signature;
+				this.#topBorderProviderRevision = revision;
+			} else {
+				topBorder = this.#topBorderContent;
+			}
 			if (topBorder) {
 				const { content, width: statusWidth } = topBorder;
 				if (statusWidth <= topFillWidth) {
@@ -1126,12 +1184,30 @@ export class Editor implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
+		// Iterative, not recursive: the bytes trailing a completed bracketed
+		// paste (which may themselves contain further pastes) loop back here,
+		// so a fragmented paste stream can never grow the call stack.
+		let next: string | undefined = data;
+		while (next !== undefined && next.length > 0) {
+			next = this.#handleInputChunk(next);
+		}
+	}
+
+	/** Process one input chunk. Returns the unconsumed tail of a completed paste, if any. */
+	#handleInputChunk(data: string): string | undefined {
 		const kb = getKeybindings();
+		// Parse the sequence once; every binding probe below is then a set
+		// lookup instead of re-parsing `data` per probe (~35 probes per key).
+		const parsedKey = parseKey(data);
+		const canonical = parsedKey === undefined ? undefined : canonicalKeyId(parsedKey);
 
 		// Handle character jump mode (awaiting next character to jump to)
 		if (this.#jumpMode !== null) {
 			// Cancel if the hotkey is pressed again
-			if (kb.matches(data, "tui.editor.jumpForward") || kb.matches(data, "tui.editor.jumpBackward")) {
+			if (
+				kb.matchesCanonical(canonical, "tui.editor.jumpForward") ||
+				kb.matchesCanonical(canonical, "tui.editor.jumpBackward")
+			) {
 				this.#jumpMode = null;
 				return;
 			}
@@ -1154,9 +1230,20 @@ export class Editor implements Component, Focusable {
 			if (paste.pasteContent !== undefined) {
 				this.#handlePaste(paste.pasteContent);
 				if (paste.remaining.length > 0) {
-					this.handleInput(paste.remaining);
+					return paste.remaining;
 				}
 			}
+			return;
+		}
+
+		// Bulk printable fast path: a multi-scalar run of plain text (paste
+		// remainder, batched stdin) parses to no key, so no binding probe or
+		// special-key branch below can consume it — it always falls through to
+		// one #insertCharacter call. Take that path directly and skip the
+		// dispatch cascade. Runs containing ESC or control bytes (including
+		// \r/\n) keep the full path: those bytes carry key semantics.
+		if (canonical === undefined && data.length > 1 && isPlainTextRun(data)) {
+			this.#insertCharacter(data);
 			return;
 		}
 
@@ -1170,7 +1257,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Undo
-		if (kb.matches(data, "tui.editor.undo")) {
+		if (kb.matchesCanonical(canonical, "tui.editor.undo")) {
 			this.#applyUndo();
 			return;
 		}
@@ -1178,34 +1265,35 @@ export class Editor implements Component, Focusable {
 		// Handle autocomplete special keys first (but don't block other input)
 		if (this.#autocompleteState && this.#autocompleteList) {
 			// Escape - cancel autocomplete
-			if (kb.matches(data, "tui.select.cancel")) {
+			if (kb.matchesCanonical(canonical, "tui.select.cancel")) {
 				this.#cancelAutocomplete(true);
 				return;
 			}
 			// Let the autocomplete list handle navigation and selection
 			else if (
-				kb.matches(data, "tui.select.up") ||
-				kb.matches(data, "tui.select.down") ||
-				kb.matches(data, "tui.select.pageUp") ||
-				kb.matches(data, "tui.select.pageDown") ||
-				kb.matches(data, "tui.input.submit") ||
+				kb.matchesCanonical(canonical, "tui.select.up") ||
+				kb.matchesCanonical(canonical, "tui.select.down") ||
+				kb.matchesCanonical(canonical, "tui.select.pageUp") ||
+				kb.matchesCanonical(canonical, "tui.select.pageDown") ||
+				kb.matchesCanonical(canonical, "tui.input.submit") ||
 				data === "\n" ||
-				kb.matches(data, "tui.input.tab")
+				kb.matchesCanonical(canonical, "tui.input.tab")
 			) {
 				// Only pass navigation keys to the list, not Enter/Tab (we handle those directly)
 				if (
-					kb.matches(data, "tui.select.up") ||
-					kb.matches(data, "tui.select.down") ||
-					kb.matches(data, "tui.select.pageUp") ||
-					kb.matches(data, "tui.select.pageDown")
+					kb.matchesCanonical(canonical, "tui.select.up") ||
+					kb.matchesCanonical(canonical, "tui.select.down") ||
+					kb.matchesCanonical(canonical, "tui.select.pageUp") ||
+					kb.matchesCanonical(canonical, "tui.select.pageDown")
 				) {
 					this.#autocompleteList.handleInput(data);
+					this.#widthEpochRevision++;
 					this.onAutocompleteUpdate?.();
 					return;
 				}
 
 				// If Tab was pressed, always apply the selection
-				if (kb.matches(data, "tui.input.tab")) {
+				if (kb.matchesCanonical(canonical, "tui.input.tab")) {
 					const selected = this.#autocompleteList.getSelectedItem();
 					// Check for stale autocomplete state due to buffer edits since last refresh
 					// (destructive keys or paste can outrun the debounced update).
@@ -1249,7 +1337,7 @@ export class Editor implements Component, Focusable {
 				// If Enter was pressed on a submitted slash command (not an absolute-path
 				// completion sharing the leading-slash prefix), apply and submit.
 				if (
-					(kb.matches(data, "tui.input.submit") || data === "\n") &&
+					(kb.matchesCanonical(canonical, "tui.input.submit") || data === "\n") &&
 					findLeadingSlashCommandStart(this.#autocompletePrefix) !== null &&
 					this.#isInSubmittedSlashCommandContext() &&
 					!this.#selectedCompletionIsPath()
@@ -1281,7 +1369,7 @@ export class Editor implements Component, Focusable {
 					// Don't return - fall through to submission logic
 				}
 				// Otherwise, apply the completion without submitting the surrounding draft.
-				else if (kb.matches(data, "tui.input.submit") || data === "\n") {
+				else if (kb.matchesCanonical(canonical, "tui.input.submit") || data === "\n") {
 					const selected = this.#autocompleteList.getSelectedItem();
 					// Check for stale autocomplete state due to buffer edits since last refresh.
 					const currentLine = this.#state.lines[this.#state.cursorLine] ?? "";
@@ -1321,44 +1409,37 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Tab key - context-aware completion (but not when already autocompleting)
-		if (kb.matches(data, "tui.input.tab") && !this.#autocompleteState) {
+		if (kb.matchesCanonical(canonical, "tui.input.tab") && !this.#autocompleteState) {
 			this.#handleTabCompletion();
 			return;
 		}
 
 		// Continue with rest of input handling
-		// Ctrl+K - Delete to end of line
-		if (matchesKey(data, "ctrl+k")) {
+		// Delete to end of line
+		if (kb.matchesCanonical(canonical, "tui.editor.deleteToLineEnd")) {
 			this.#deleteToEndOfLine();
 		}
-		// Ctrl+U - Delete to start of line
-		else if (matchesKey(data, "ctrl+u")) {
+		// Delete to start of line
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteToLineStart")) {
 			this.#deleteToStartOfLine();
 		}
-		// Ctrl+W - Delete word backwards
-		else if (matchesKey(data, "ctrl+w")) {
+		// Delete word backward. Registry defaults cover ctrl+w, alt+backspace,
+		// ctrl+backspace, and super+alt+backspace (Ghostty on macOS reports
+		// Option+Backspace as super+alt — kitty mod 11, see #2064).
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteWordBackward")) {
 			this.#deleteWordBackwards();
 		}
-		// Option/Alt+Backspace - Delete word backwards.
-		// Ghostty on macOS reports Option+Backspace as super+alt (kitty mod 11) — see #2064.
-		else if (matchesKey(data, "alt+backspace") || matchesKey(data, "super+alt+backspace")) {
-			this.#deleteWordBackwards();
-		}
-		// Option/Alt+D and Option+Delete - Delete word forwards. Same Ghostty quirk applies.
-		else if (
-			matchesKey(data, "alt+d") ||
-			matchesKey(data, "alt+delete") ||
-			matchesKey(data, "super+alt+d") ||
-			matchesKey(data, "super+alt+delete")
-		) {
+		// Delete word forward. Registry defaults cover alt+d/alt+delete and their
+		// super+alt variants for the same Ghostty quirk.
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteWordForward")) {
 			this.#deleteWordForwards();
 		}
-		// Ctrl+Y - Yank from kill ring
-		else if (matchesKey(data, "ctrl+y")) {
+		// Yank from kill ring
+		else if (kb.matchesCanonical(canonical, "tui.editor.yank")) {
 			this.#yankFromKillRing();
 		}
-		// Alt+Y - Yank-pop (cycle kill ring)
-		else if (matchesKey(data, "alt+y")) {
+		// Yank-pop (cycle kill ring)
+		else if (kb.matchesCanonical(canonical, "tui.editor.yankPop")) {
 			this.#yankPop();
 		}
 		// Ctrl+A - Move to start of line
@@ -1383,7 +1464,7 @@ export class Editor implements Component, Focusable {
 			matchesKey(data, "ctrl+enter") || // Ctrl+Enter (Kitty/modifyOtherKeys, including lock bits/keypad Enter)
 			data === "\x1b\r" || // Option+Enter in some terminals (legacy)
 			data === "\x1b[13;2~" || // Shift+Enter in some terminals (legacy format)
-			kb.matches(data, "tui.input.newLine") || // Shift+Enter (Kitty protocol, handles lock bits)
+			kb.matchesCanonical(canonical, "tui.input.newLine") || // Shift+Enter (Kitty protocol, handles lock bits)
 			(data.length > 1 && data.includes("\x1b") && data.includes("\r")) ||
 			(data === "\n" && data.length === 1) // Shift+Enter from iTerm2 mapping
 		) {
@@ -1395,7 +1476,7 @@ export class Editor implements Component, Focusable {
 			this.#addNewLine();
 		}
 		// Plain Enter - submit (handles both legacy \r and Kitty protocol with lock bits)
-		else if (kb.matches(data, "tui.input.submit") || data === "\n") {
+		else if (kb.matchesCanonical(canonical, "tui.input.submit") || data === "\n") {
 			// If submit is disabled, do nothing
 			if (this.disableSubmit) {
 				return;
@@ -1436,40 +1517,40 @@ export class Editor implements Component, Focusable {
 			this.#submitValue();
 		}
 		// Backspace (including Shift+Backspace)
-		else if (kb.matches(data, "tui.editor.deleteCharBackward") || matchesKey(data, "shift+backspace")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteCharBackward") || matchesKey(data, "shift+backspace")) {
 			this.#handleBackspace();
 		}
 		// Line navigation shortcuts (Home/End keys)
-		else if (kb.matches(data, "tui.editor.cursorLineStart")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.cursorLineStart")) {
 			this.#moveToLineStart();
-		} else if (kb.matches(data, "tui.editor.cursorLineEnd")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorLineEnd")) {
 			this.#moveToLineEnd();
 		}
 		// Page navigation (PageUp/PageDown): page the editor viewport only. On a
 		// short draft this is a no-op — it never steps prompt history (that stays
 		// on Up/Down), so an idle empty editor swallows the keys instead of
 		// surprising the user by loading the previous prompt (#4754).
-		else if (kb.matches(data, "tui.editor.pageUp")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.pageUp")) {
 			this.#pageScroll(-1);
-		} else if (kb.matches(data, "tui.editor.pageDown")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.pageDown")) {
 			this.#pageScroll(1);
 		}
 		// Forward delete (Fn+Backspace or Delete key, including Shift+Delete)
-		else if (kb.matches(data, "tui.editor.deleteCharForward") || matchesKey(data, "shift+delete")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.deleteCharForward") || matchesKey(data, "shift+delete")) {
 			this.#handleForwardDelete();
 		}
 		// Word navigation (Option/Alt + Arrow or Ctrl + Arrow)
-		else if (kb.matches(data, "tui.editor.cursorWordLeft")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.cursorWordLeft")) {
 			// Word left
 			this.#resetKillSequence();
 			this.#moveWordBackwards();
-		} else if (kb.matches(data, "tui.editor.cursorWordRight")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorWordRight")) {
 			// Word right
 			this.#resetKillSequence();
 			this.#moveWordForwards();
 		}
 		// Arrow keys
-		else if (kb.matches(data, "tui.editor.cursorUp")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.cursorUp")) {
 			// Up - history navigation or cursor movement
 			if (this.#isEditorEmpty()) {
 				this.#navigateHistory(-1); // Start browsing history
@@ -1481,7 +1562,7 @@ export class Editor implements Component, Focusable {
 			} else {
 				this.#moveCursor(-1, 0); // Cursor movement (within text or history entry)
 			}
-		} else if (kb.matches(data, "tui.editor.cursorDown")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorDown")) {
 			// Down - history navigation or cursor movement
 			if (this.#historyIndex > -1 && this.#isOnLastVisualLine()) {
 				this.#navigateHistory(1); // Navigate to newer history entry or clear
@@ -1491,10 +1572,10 @@ export class Editor implements Component, Focusable {
 			} else {
 				this.#moveCursor(1, 0); // Cursor movement (within text or history entry)
 			}
-		} else if (kb.matches(data, "tui.editor.cursorRight")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorRight")) {
 			// Right
 			this.#moveCursor(0, 1);
-		} else if (kb.matches(data, "tui.editor.cursorLeft")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.cursorLeft")) {
 			// Left
 			this.#moveCursor(0, -1);
 		}
@@ -1503,9 +1584,9 @@ export class Editor implements Component, Focusable {
 			this.#insertCharacter(" ");
 		}
 		// Character jump mode triggers
-		else if (kb.matches(data, "tui.editor.jumpForward")) {
+		else if (kb.matchesCanonical(canonical, "tui.editor.jumpForward")) {
 			this.#jumpMode = "forward";
-		} else if (kb.matches(data, "tui.editor.jumpBackward")) {
+		} else if (kb.matchesCanonical(canonical, "tui.editor.jumpBackward")) {
 			this.#jumpMode = "backward";
 		}
 		// Printable keystrokes, including Kitty CSI-u text-producing sequences.
@@ -1635,6 +1716,24 @@ export class Editor implements Component, Focusable {
 
 	getText(): string {
 		return this.#state.lines.join("\n");
+	}
+
+	getNativeScrollbackWidthEpochRevision(): number {
+		const text = this.getText();
+		if (text !== this.#widthEpochText) {
+			this.#widthEpochText = text;
+			this.#widthEpochRevision++;
+		}
+		return this.#widthEpochRevision;
+	}
+
+	/** Whether the buffer text equals `value`, without `getText()`'s full join —
+	 *  O(1) for the hot per-keystroke probes against short single-line values. */
+	textEquals(value: string): boolean {
+		const lines = this.#state.lines;
+		if (lines.length === 1) return lines[0] === value;
+		if (value.indexOf("\n") === -1) return false;
+		return this.getText() === value;
 	}
 
 	#expandPasteMarkers(text: string): string {
@@ -3107,6 +3206,7 @@ export class Editor implements Component, Focusable {
 			this.#autocompletePrefix = suggestions.prefix;
 			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
 			this.#autocompleteState = "regular";
+			this.#widthEpochRevision++;
 			this.onAutocompleteUpdate?.();
 		} else {
 			this.#cancelAutocomplete();
@@ -3165,6 +3265,7 @@ export class Editor implements Component, Focusable {
 			this.#autocompletePrefix = suggestions.prefix;
 			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
 			this.#autocompleteState = "force";
+			this.#widthEpochRevision++;
 			this.onAutocompleteUpdate?.();
 		} else {
 			this.#cancelAutocomplete();
@@ -3179,6 +3280,7 @@ export class Editor implements Component, Focusable {
 		this.#autocompleteState = null;
 		this.#autocompleteList = undefined;
 		this.#autocompletePrefix = "";
+		if (wasAutocompleting) this.#widthEpochRevision++;
 		if (notifyCancel && wasAutocompleting) {
 			this.onAutocompleteCancel?.();
 		}
@@ -3210,6 +3312,7 @@ export class Editor implements Component, Focusable {
 			this.#autocompletePrefix = suggestions.prefix;
 			// Always create new SelectList to ensure update
 			this.#autocompleteList = this.#createAutocompleteList(suggestions.prefix, suggestions.items);
+			this.#widthEpochRevision++;
 			this.onAutocompleteUpdate?.();
 		} else {
 			this.#cancelAutocomplete();

@@ -2,6 +2,7 @@ import { THINKING_EFFORTS } from "@oh-my-pi/pi-ai";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { SHAPE_VARIANT_NAMES } from "@oh-my-pi/snapcompact";
 import { DEFAULT_RELAY_URL } from "../collab/protocol";
+import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "../live/voices";
 import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS, STT_MODEL_VALUES } from "../stt/models";
 import { STT_SUBMIT_TRIGGER_OPTIONS, STT_SUBMIT_TRIGGER_VALUES } from "../stt/submit-trigger";
 import { AUTO_THINKING, getConfiguredThinkingLevelMetadata, getThinkingLevelMetadata } from "../thinking";
@@ -36,7 +37,12 @@ import {
 	TTS_LOCAL_VOICE_VALUES,
 } from "../tts/models";
 import { EDIT_MODES } from "../utils/edit-mode";
-import { SEARCH_PROVIDER_CHOICES, type SearchProviderId } from "../web/search/types";
+import {
+	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
+	MAX_WEB_SEARCH_TIMEOUT_SECONDS,
+	SEARCH_PROVIDER_CHOICES,
+	type SearchProviderId,
+} from "../web/search/types";
 import {
 	SERVICE_TIER_ANTHROPIC_OPTIONS,
 	SERVICE_TIER_ANTHROPIC_VALUES,
@@ -234,38 +240,50 @@ export type AnyUiMetadata = UiBase & {
 	ordered?: boolean;
 };
 
-interface BooleanDef {
+/**
+ * Marks a setting whose value is a credential.
+ *
+ * Lives at the top level rather than inside `ui` so it can also describe a
+ * setting the settings panel never shows and therefore cannot carry
+ * `ui.secret`. Read it through `isCredential`, which is the single accessor
+ * both the CLI and the settings panel consult.
+ */
+interface CredentialMarker {
+	credential?: true;
+}
+
+interface BooleanDef extends CredentialMarker {
 	type: "boolean";
 	default: boolean | undefined;
 	ui?: UiBoolean;
 }
 
-interface StringDef {
+interface StringDef extends CredentialMarker {
 	type: "string";
 	default: string | undefined;
 	ui?: UiString;
 }
 
-interface NumberDef {
+interface NumberDef extends CredentialMarker {
 	type: "number";
 	default: number | undefined;
 	ui?: UiNumber;
 }
 
-interface EnumDef<T extends readonly string[]> {
+interface EnumDef<T extends readonly string[]> extends CredentialMarker {
 	type: "enum";
 	values: T;
 	default: T[number];
 	ui?: UiEnum<T>;
 }
 
-interface ArrayDef<T> {
+interface ArrayDef<T> extends CredentialMarker {
 	type: "array";
 	default: T[];
 	ui?: UiArray;
 }
 
-interface RecordDef<T> {
+interface RecordDef<T> extends CredentialMarker {
 	type: "record";
 	default: Record<string, T>;
 	ui?: UiBase;
@@ -367,6 +385,8 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	},
 ];
 
+const DEFAULT_AGENT_MODEL_OVERRIDES: Record<string, string | string[]> = {};
+
 export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	// General settings (no UI)
@@ -378,7 +398,7 @@ export const SETTINGS_SCHEMA = {
 	// Env (`OMP_AUTH_BROKER_URL` / `OMP_AUTH_BROKER_TOKEN`) takes precedence so
 	// per-machine overrides remain trivial.
 	"auth.broker.url": { type: "string", default: undefined },
-	"auth.broker.token": { type: "string", default: undefined },
+	"auth.broker.token": { type: "string", default: undefined, credential: true },
 
 	autoResume: {
 		type: "boolean",
@@ -446,17 +466,6 @@ export const SETTINGS_SCHEMA = {
 			label: "Enable Prewalk",
 			description:
 				"Start on the active model, then switch to a fast/cheap model (default the 'smol' role) at the first edit/write after the plan nudge's todo list exists — the strong model plans, commits the todos, and starts the implementation before handing off. Overridable per session with --prewalk / --no-prewalk.",
-		},
-	},
-	"advisor.subagents": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "model",
-			group: "Advisor",
-			label: "Advisor for Subagents",
-			description: "Also enable the advisor on spawned task/eval subagents.",
-			condition: "advisorEnabled",
 		},
 	},
 	"advisor.syncBacklog": {
@@ -914,6 +923,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"tui.codexResetFireworks": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Codex Reset Fireworks",
+			description:
+				"Celebrate unscheduled Codex weekly usage resets and newly banked saved resets with a top-third fireworks overlay that remains until Escape",
+		},
+	},
+
 	"tui.titleState": {
 		type: "boolean",
 		default: true,
@@ -922,7 +943,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Display",
 			label: "Terminal Title Run State",
 			description:
-				"Show the agent run state in the terminal title's separator — an animated spinner while working, '>' when it's your turn, '!' when the agent is waiting on you",
+				"Show the agent run state in the terminal title's separator — an animated spinner while working (a static ':' on Windows), '>' when it's your turn, '!' when the agent is waiting on you",
 		},
 	},
 
@@ -985,6 +1006,17 @@ export const SETTINGS_SCHEMA = {
 			group: "Display",
 			label: "Smooth Streaming",
 			description: "Reveal assistant text and streamed tool input smoothly while chunks arrive",
+		},
+	},
+
+	"display.hideToolActivity": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Hide Tool Activity",
+			description: "Hide model-initiated tool calls and results from the transcript",
 		},
 	},
 
@@ -1095,6 +1127,17 @@ export const SETTINGS_SCHEMA = {
 			label: "Omit Thinking summaries",
 			description:
 				"Instruct upstream providers to completely omit thinking summaries from responses (where supported)",
+		},
+	},
+
+	externalThinking: {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "External Thinking",
+			description: "Private scratchpad; not shown to user. Disables supported GPT, Claude, and Gemini reasoning",
 		},
 	},
 
@@ -1798,14 +1841,32 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	collapseChangelog: {
-		type: "boolean",
-		default: false,
+	"startup.changelogMode": {
+		type: "enum",
+		values: ["summary", "expanded", "hidden"] as const,
+		default: "summary",
 		ui: {
 			tab: "interaction",
 			group: "Startup & Updates",
-			label: "Collapse Changelog",
-			description: "Show condensed changelog after updates",
+			label: "Startup Changelog",
+			description: "Choose whether update notes start as a summary, full details, or stay hidden",
+			options: [
+				{
+					value: "summary",
+					label: "Summary",
+					description: "Show release and change counts with a /changelog hint",
+				},
+				{
+					value: "expanded",
+					label: "Expanded",
+					description: "Show the recent release notes in full",
+				},
+				{
+					value: "hidden",
+					label: "Hidden",
+					description: "Do not show release notes on startup",
+				},
+			],
 		},
 	},
 
@@ -2776,6 +2837,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"mnemopi.embeddingApiKey": {
 		type: "string",
+		credential: true,
 		default: undefined,
 		ui: {
 			tab: "memory",
@@ -2820,6 +2882,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"mnemopi.llmApiKey": {
 		type: "string",
+		credential: true,
 		default: undefined,
 		ui: {
 			tab: "memory",
@@ -2862,6 +2925,7 @@ export const SETTINGS_SCHEMA = {
 
 	"hindsight.apiToken": {
 		type: "string",
+		credential: true,
 		default: undefined,
 		ui: {
 			tab: "memory",
@@ -2869,7 +2933,6 @@ export const SETTINGS_SCHEMA = {
 			label: "Hindsight API Token",
 			description: "Bearer token for authenticated Hindsight servers",
 			condition: "hindsightActive",
-			secret: true,
 		},
 	},
 
@@ -3334,6 +3397,18 @@ export const SETTINGS_SCHEMA = {
 			label: "Lazy LSP Startup",
 			description:
 				"Start language servers on first use (lsp tool or editing a matching file type) instead of at session startup",
+		},
+	},
+
+	"lsp.shared": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "files",
+			group: "LSP",
+			label: "Shared Language Servers",
+			description:
+				"Share one language server per project across omp instances via the daemon broker (falls back to private servers when unavailable)",
 		},
 	},
 
@@ -3820,14 +3895,28 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// Legacy boolean kept only for back-compat migration to `inspect_image.mode`
+	// (see config/settings.ts). Hidden from UI.
 	"inspect_image.enabled": {
 		type: "boolean",
 		default: false,
+	},
+
+	"inspect_image.mode": {
+		type: "enum",
+		values: ["auto", "on", "off"] as const,
+		default: "auto",
 		ui: {
 			tab: "tools",
 			group: "Available Tools",
 			label: "Inspect Image",
-			description: "Enable the inspect_image tool, delegating image understanding to a vision-capable model",
+			description:
+				"Controls the inspect_image tool, which delegates image understanding to a vision-capable model. 'auto' exposes it only when the active model lacks native image input; 'on' always exposes it; 'off' never does.",
+			options: [
+				{ value: "auto", label: "Auto (only for models without vision)" },
+				{ value: "on", label: "On" },
+				{ value: "off", label: "Off" },
+			],
 		},
 	},
 
@@ -3838,23 +3927,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			group: "Available Tools",
 			label: "Computer",
-			description: "Enable native host-desktop screenshots and input for OpenAI computer use",
-		},
-	},
-
-	"computer.backend": {
-		type: "enum",
-		values: ["auto", "native"] as const,
-		default: "auto",
-		ui: {
-			tab: "tools",
-			group: "Computer",
-			label: "Computer Backend",
-			description: "Select automatic or explicit platform-native desktop capture and input",
-			options: [
-				{ value: "auto", label: "Auto" },
-				{ value: "native", label: "Native" },
-			],
+			description: "Enable the scriptable host-desktop control tool (screenshots, input, accessibility)",
 		},
 	},
 
@@ -3871,7 +3944,7 @@ export const SETTINGS_SCHEMA = {
 
 	"computer.maxWidth": {
 		type: "number",
-		default: 1920,
+		default: 3840,
 		ui: {
 			tab: "tools",
 			group: "Computer",
@@ -3882,12 +3955,31 @@ export const SETTINGS_SCHEMA = {
 
 	"computer.maxHeight": {
 		type: "number",
-		default: 1200,
+		default: 2400,
 		ui: {
 			tab: "tools",
 			group: "Computer",
 			label: "Computer Screenshot Height",
 			description: "Maximum composite screenshot height in pixels",
+		},
+	},
+
+	"inspect_image.timeoutMs": {
+		type: "number",
+		default: 300_000,
+		ui: {
+			tab: "tools",
+			group: "Execution",
+			label: "Inspect Image Timeout",
+			description:
+				"Per-request timeout for the inspect_image vision-model call, in milliseconds. A stalled provider fails fast with a timeout error instead of blocking until manual abort. Set to 0 to disable the timeout.",
+			options: [
+				{ value: "0", label: "Disabled" },
+				{ value: "60000", label: "1 minute" },
+				{ value: "120000", label: "2 minutes" },
+				{ value: "180000", label: "3 minutes" },
+				{ value: "300000", label: "5 minutes" },
+			],
 		},
 	},
 
@@ -3984,6 +4076,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"security.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Security",
+			description:
+				"Enable OMP-native security scan planning, execution, and the read-only security:// resource namespace",
+		},
+	},
+
 	"ask.enabled": {
 		type: "boolean",
 		default: true,
@@ -4003,6 +4107,41 @@ export const SETTINGS_SCHEMA = {
 			group: "Available Tools",
 			label: "Browser",
 			description: "Enable the browser tool for scripted Chromium automation (puppeteer)",
+		},
+	},
+
+	"browser.cdpUrl": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Browser CDP URL",
+			description:
+				"Default HTTP CDP discovery endpoint (for example http://127.0.0.1:9222) to attach to instead of launching a browser. Explicit app.cdp_url or app.path on the tool call take precedence.",
+		},
+	},
+
+	"browser.relay": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Browser Relay",
+			description:
+				"Drive your own Chrome tabs through the omp browser relay. Install the extension once (`omp browser-relay install`); the relay server auto-starts when the browser tool needs it. Takes precedence over Browser CDP URL; set PI_BROWSER_RELAY=0 or PI_BROWSER_RELAY=1 to override.",
+		},
+	},
+
+	"browser.relayUrl": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "tools",
+			group: "Grep & Browser",
+			label: "Browser Relay URL",
+			description: "omp browser relay endpoint (default http://127.0.0.1:9224).",
 		},
 	},
 
@@ -4152,7 +4291,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Discovery & MCP",
 			label: "xd:// Tools",
 			description:
-				"Mount rarely-used (discoverable) tools under xd:// device URLs driven via read/write instead of shipping their schemas on every request. Disable to expose every enabled tool top-level.",
+				"Mount rarely-used (discoverable) tools under xd:// device URLs driven via read/write instead of shipping their schemas on every request. Sessions without a granted write tool skip mounting and expose every tool top-level. Disable to expose every enabled tool top-level.",
 		},
 	},
 
@@ -4442,6 +4581,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.enableEffort": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Per-Task Effort",
+			description:
+				"Expose the optional effort parameter on task spawns, allowing callers to override each subagent's thinking level",
+		},
+	},
+
 	"task.maxConcurrency": {
 		type: "number",
 		default: 32,
@@ -4532,7 +4683,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Subagents",
 			label: "Soft Subagent Request Budget",
 			description:
-				"Soft per-subagent request budget (assistant requests per run). Crossing it injects a wrap-up steering notice (see task.softRequestBudgetNotice); at 1.5x the budget the run is force-stopped and the agent must yield its partial findings. 0 disables the guard. Bundled scout/sonic agents use a lower built-in budget.",
+				"Soft per-subagent request budget (assistant requests per run). Crossing it injects a wrap-up steering notice (see task.softRequestBudgetNotice); at 1.5x the budget the run is force-stopped and the agent must yield its partial findings. 0 disables the guard. Bundled scout/sonic agents cap out at a lower built-in budget, so a value below that cap still applies to them.",
 			options: [
 				{ value: "0", label: "Disabled" },
 				{ value: "90", label: "90 requests" },
@@ -4554,6 +4705,20 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.maxEffort": {
+		type: "enum",
+		values: THINKING_EFFORTS,
+		default: "max",
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Maximum Per-Spawn Effort",
+			description:
+				"Maximum reasoning effort allowed for the task tool's per-spawn effort hint. Lower values prevent callers from escalating subagents above this ceiling; the default preserves the model's full range.",
+			options: THINKING_EFFORTS.map(getThinkingLevelMetadata),
+		},
+	},
+
 	"task.disabledAgents": {
 		type: "array",
 		default: [] as string[],
@@ -4561,9 +4726,13 @@ export const SETTINGS_SCHEMA = {
 
 	"task.agentModelOverrides": {
 		type: "record",
-		default: {} as Record<string, string>,
+		default: DEFAULT_AGENT_MODEL_OVERRIDES,
 	},
 	"task.agentPrewalk": {
+		type: "record",
+		default: {} as Record<string, string>,
+	},
+	"task.agentAdvisor": {
 		type: "record",
 		default: {} as Record<string, string>,
 	},
@@ -4575,7 +4744,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Subagents",
 			label: "Generic Task Prewalk",
 			description:
-				"Arm prewalk for the bundled generic `task` subagent: it starts on its resolved model, plans and begins the implementation, then hands off to the 'smol' role at its first edit/write. Per-agent overrides (task.agentPrewalk, toggled with P in /agents) and user agent `prewalk` frontmatter apply regardless of this toggle.",
+				"Arm prewalk for the bundled generic `task` subagent: it starts on its resolved model, plans and begins the implementation, then hands off to the 'smol' role at its first edit/write. Per-agent overrides (task.agentPrewalk, configured from the /agents hub) and user agent `prewalk` frontmatter apply regardless of this toggle.",
 		},
 	},
 
@@ -4741,6 +4910,23 @@ export const SETTINGS_SCHEMA = {
 			options: SEARCH_PROVIDER_CHOICES,
 		},
 	},
+	"providers.webSearchTimeoutSeconds": {
+		type: "number",
+		default: DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Web Search Timeout",
+			description: `Hard timeout for each provider's search transport before web_search advances to the next fallback, in seconds (maximum ${MAX_WEB_SEARCH_TIMEOUT_SECONDS})`,
+			options: [
+				{ value: "30", label: "30 seconds" },
+				{ value: "60", label: "1 minute" },
+				{ value: "120", label: "2 minutes" },
+				{ value: "180", label: "3 minutes" },
+				{ value: "300", label: "5 minutes" },
+			],
+		},
+	},
 	"providers.webSearchGeminiModel": {
 		type: "string",
 		default: undefined,
@@ -4810,6 +4996,18 @@ export const SETTINGS_SCHEMA = {
 					description: "Priority serving path: higher reliability, premium per-token pricing",
 				},
 			],
+		},
+	},
+	"live.voice": {
+		type: "enum",
+		values: LIVE_VOICE_VALUES,
+		default: DEFAULT_LIVE_VOICE,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Live Voice",
+			description: "Voice used by Codex-backed realtime voice sessions",
+			options: LIVE_VOICE_OPTIONS,
 		},
 	},
 	"providers.tts": {
@@ -4978,6 +5176,23 @@ export const SETTINGS_SCHEMA = {
 			options: AUTO_THINKING_MODEL_OPTIONS,
 		},
 	},
+	"providers.autoThinkingMaxEffort": {
+		type: "enum",
+		values: ["xhigh", "max"] as const,
+		default: "xhigh",
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Auto Thinking Ceiling",
+			description:
+				"Highest effort the `auto` classifier may resolve. `xhigh` keeps the classifier one tier below the top, so only an explicit `ultrathink` reaches `max`; `max` lets a turn the classifier judges exceptional bill the top tier on models that expose it.",
+			condition: "autoThinkingActive",
+			options: [
+				{ value: "xhigh", label: "xhigh", description: "Classifier stops at xhigh (default)" },
+				{ value: "max", label: "max", description: "Classifier may resolve max where the model supports it" },
+			],
+		},
+	},
 	"features.unexpectedStopDetection": {
 		type: "boolean",
 		default: false,
@@ -5132,7 +5347,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Services",
 			label: "Codex Auto-Redeem Saved Resets",
 			description:
-				"When a turn is blocked by the Codex weekly limit on the active account and no other account is available, run the conservative saved-reset check. unset asks before spending the first eligible reset, yes spends eligible resets without prompting, and no disables the check entirely. Requires retries enabled.",
+				"Spend saved Codex rate-limit resets automatically: restore an account blocked by an exhausted 5h or weekly window when a turn is stuck and no other account can take over, and salvage credits that are about to expire. unset asks before the first spend, yes spends without prompting, and no disables both checks.",
 			options: [
 				{
 					value: "unset",
@@ -5152,7 +5367,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Services",
 			label: "Codex Auto-Redeem Min Block",
 			description:
-				"Only auto-redeem when the natural weekly reset is at least this many minutes away (don't spend a ~30-day credit to save a short wait).",
+				"Only auto-redeem when the natural unblock — the latest reset among the exhausted 5h/weekly windows — is at least this many minutes away (don't spend a scarce credit to save a short wait). Raise it (e.g. 360) to ignore 5h-only blocks.",
 		},
 	},
 	"codexResets.keepCredits": {
@@ -5162,7 +5377,19 @@ export const SETTINGS_SCHEMA = {
 			tab: "providers",
 			group: "Services",
 			label: "Codex Auto-Redeem Reserve",
-			description: "Never auto-spend below this many saved resets (0 = the last credit may be spent automatically).",
+			description:
+				"Never auto-spend below this many saved resets (0 = the last credit may be spent automatically). Credits about to expire are exempt — a reserved credit that expires preserves nothing.",
+		},
+	},
+	"codexResets.salvageHorizonHours": {
+		type: "number",
+		default: 12,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Codex Reset Salvage Horizon",
+			description:
+				"Spend a saved Codex reset automatically when it would otherwise expire within this many hours and either chat window (5h or weekly) has meaningful usage to restore (0 disables expiry salvage).",
 		},
 	},
 	"provider.appendOnlyContext": {
@@ -5187,17 +5414,11 @@ export const SETTINGS_SCHEMA = {
 	"exa.enabled": {
 		type: "boolean",
 		default: true,
-		ui: { tab: "providers", group: "Services", label: "Exa", description: "Master toggle for all Exa search tools" },
-	},
-
-	"exa.enableSearch": {
-		type: "boolean",
-		default: true,
 		ui: {
 			tab: "providers",
 			group: "Services",
-			label: "Exa Search",
-			description: "Enable Exa basic search, deep search, code search, and crawl tools",
+			label: "Exa",
+			description: "Enable the Exa web search provider",
 		},
 	},
 
@@ -5209,28 +5430,6 @@ export const SETTINGS_SCHEMA = {
 			group: "Services",
 			label: "Exa Search Delay",
 			description: "Minimum delay between Exa web search requests in milliseconds; set 0 to disable pacing",
-		},
-	},
-
-	"exa.enableResearcher": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "providers",
-			group: "Services",
-			label: "Exa Researcher",
-			description: "Enable the Exa researcher tool for AI-powered deep research",
-		},
-	},
-
-	"exa.enableWebsets": {
-		type: "boolean",
-		default: false,
-		ui: {
-			tab: "providers",
-			group: "Services",
-			label: "Exa Websets",
-			description: "Enable Exa webset management and enrichment tools",
 		},
 	},
 
@@ -5249,6 +5448,7 @@ export const SETTINGS_SCHEMA = {
 	"searxng.token": {
 		type: "string",
 		default: undefined,
+		credential: true,
 	},
 
 	"searxng.basicUsername": {
@@ -5259,6 +5459,7 @@ export const SETTINGS_SCHEMA = {
 	"searxng.basicPassword": {
 		type: "string",
 		default: undefined,
+		credential: true,
 	},
 
 	"searxng.categories": {
@@ -5273,6 +5474,11 @@ export const SETTINGS_SCHEMA = {
 
 	"searxng.language": {
 		type: "string",
+		default: undefined,
+	},
+
+	"searxng.safesearch": {
+		type: "number",
 		default: undefined,
 	},
 
@@ -5314,6 +5520,7 @@ export const SETTINGS_SCHEMA = {
 	"dev.autoqaPush.token": {
 		type: "string",
 		default: undefined,
+		credential: true,
 	},
 
 	/**
@@ -5398,6 +5605,20 @@ export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
 /** Check if a path has UI metadata (should appear in settings panel) */
 export function hasUi(path: SettingPath): boolean {
 	return "ui" in SETTINGS_SCHEMA[path];
+}
+
+/**
+ * Whether a setting holds a credential and must never be printed or exported
+ * without an explicit request. Drives both CLI redaction and settings-panel
+ * masking, so the two cannot disagree.
+ */
+export function isCredential(path: SettingPath): boolean {
+	const def = SETTINGS_SCHEMA[path];
+	if ("credential" in def && def.credential === true) return true;
+	// `ui.secret` predates this marker and still means "never display". Reading
+	// both here keeps ONE accessor, so the two spellings cannot produce
+	// different behaviour on different surfaces.
+	return getUi(path)?.secret === true;
 }
 
 /** Get UI metadata for a path (undefined if no UI) */
@@ -5556,10 +5777,7 @@ export interface TtsrSettings {
 
 export interface ExaSettings {
 	enabled: boolean;
-	enableSearch: boolean;
 	searchDelayMs: number;
-	enableResearcher: boolean;
-	enableWebsets: boolean;
 }
 
 export interface StatusLineSettings {
@@ -5610,6 +5828,7 @@ export interface CodexResetsSettings {
 	autoRedeem: CodexAutoRedeemMode;
 	minBlockedMinutes: number;
 	keepCredits: number;
+	salvageHorizonHours: number;
 }
 
 export interface GcSettings {

@@ -69,7 +69,7 @@ function buildToolResult(toolCallId: string, timestamp: number): ToolResultMessa
 		toolName: "read",
 		content: [
 			{ type: "text", text: "Read image file [image/png]" },
-			{ type: "image", data: "ZmFrZQ==", mimeType: "image/png" },
+			{ type: "image", data: "ZmFrZQ==", mimeType: "image/png", detail: "original" },
 		],
 		isError: false,
 		timestamp,
@@ -119,7 +119,7 @@ describe("openai-completions convertMessages", () => {
 		]);
 	});
 
-	it("batches tool-result images after consecutive tool results", () => {
+	it("batches tool-result images without unsupported original-detail metadata", () => {
 		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
 		const model: Model<"openai-completions"> = {
 			...baseModel,
@@ -159,8 +159,13 @@ describe("openai-completions convertMessages", () => {
 		expect(imageMessage.role).toBe("user");
 		expect(Array.isArray(imageMessage.content)).toBe(true);
 
-		const imageParts = (imageMessage.content as Array<{ type?: string }>).filter(part => part?.type === "image_url");
-		expect(imageParts.length).toBe(2);
+		const imageParts = (
+			imageMessage.content as Array<{ type?: string; image_url?: { url: string; detail?: string } }>
+		).filter(part => part?.type === "image_url");
+		expect(imageParts).toEqual([
+			{ type: "image_url", image_url: { url: "data:image/png;base64,ZmFrZQ==" } },
+			{ type: "image_url", image_url: { url: "data:image/png;base64,ZmFrZQ==" } },
+		]);
 	});
 	it("serializes assistant tool-call turns with string content for strict OpenAI-compatible backends", () => {
 		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
@@ -389,8 +394,11 @@ describe("openai-completions convertMessages", () => {
 	it("preserves image_url for DashScope compatible-mode multimodal Qwen models", () => {
 		// Counter-cases for the issue #1859 guard: DashScope also exposes
 		// genuinely multimodal Qwen ids without `vl` in the name (`qwen3.7-plus`),
-		// so the text-only override must be limited to known text-only families.
-		for (const id of ["qwen3.7-plus", "qwen-vl-max"]) {
+		// and Qwen-Max is multimodal from `qwen3.8-max` onward (issue #8305) —
+		// including `qwen3.10-max`, which a decimal-float compare would wrongly
+		// sort below 3.8 — so the text-only override must stay limited to the
+		// known text-only families.
+		for (const id of ["qwen3.7-plus", "qwen-vl-max", "qwen3.8-max", "qwen3.8-max-preview", "qwen3.10-max"]) {
 			const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
 			const model: Model<"openai-completions"> = {
 				...baseModel,

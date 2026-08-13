@@ -2,7 +2,7 @@ import { scheduler } from "node:timers/promises";
 import { bareModelId, parseAnthropicModel } from "@oh-my-pi/pi-catalog/identity";
 import { toNumber } from "@oh-my-pi/pi-catalog/utils";
 import * as AIError from "../error";
-import { claudeCodeVersion } from "../providers/anthropic";
+import { claudeCodeVersion } from "../providers/claude-code-fingerprint";
 import {
 	type CredentialRankingContext,
 	type CredentialRankingStrategy,
@@ -17,10 +17,9 @@ import {
 	type UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
+import { HOUR_MS, parseIsoTimestamp, WEEK_MS } from "./shared";
 
 const DEFAULT_ENDPOINT = "https://api.anthropic.com/api/oauth";
-const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ATTEMPTS = 3;
 const BASE_RETRY_DELAY_MS = 500;
 
@@ -123,16 +122,10 @@ interface ParsedApiLimitEntry {
 	displayName?: string;
 }
 
-function parseIsoTime(value: string | undefined): number | undefined {
-	if (!value) return undefined;
-	const parsed = Date.parse(value);
-	return Number.isFinite(parsed) ? parsed : undefined;
-}
-
 function parseBucket(bucket: unknown): ParsedUsageBucket | undefined {
 	if (!isRecord(bucket)) return undefined;
 	const utilization = toNumber(bucket.utilization);
-	const resetsAt = parseIsoTime(typeof bucket.resets_at === "string" ? bucket.resets_at : undefined);
+	const resetsAt = parseIsoTimestamp(typeof bucket.resets_at === "string" ? bucket.resets_at : undefined);
 	if (utilization === undefined && resetsAt === undefined) {
 		return undefined;
 	}
@@ -153,6 +146,12 @@ function getApiLimitDisplayName(scope: unknown): string | undefined {
  * `seven_day_sonnet`) are permanently null. Model-scoped weekly caps now arrive
  * only through generic `limits[]` entries (`kind: "weekly_scoped"`) with the
  * model family named by `scope.model.display_name`.
+ *
+ * `is_active` is deliberately ignored: live payloads mark only the currently
+ * binding limit active (an account pinned at a 100% Fable cap reports its 77%
+ * shared weekly row as `is_active: false`), so it signals severity ranking,
+ * not bucket existence. Filtering on it hid real utilization — a scoped row
+ * at 5% with a live reset rendered as `not reported` in `omp usage`.
  */
 function parseApiLimitEntries(raw: unknown): ParsedApiLimitEntry[] {
 	if (!Array.isArray(raw)) return [];
@@ -161,9 +160,8 @@ function parseApiLimitEntries(raw: unknown): ParsedApiLimitEntry[] {
 		if (!isRecord(rawEntry)) continue;
 		const entry = rawEntry as ClaudeApiLimitEntry;
 		if (typeof entry.kind !== "string") continue;
-		if (entry.is_active === false) continue;
 		const utilization = toNumber(entry.percent);
-		const resetsAt = parseIsoTime(typeof entry.resets_at === "string" ? entry.resets_at : undefined);
+		const resetsAt = parseIsoTimestamp(typeof entry.resets_at === "string" ? entry.resets_at : undefined);
 		if (utilization === undefined && resetsAt === undefined) continue;
 		const displayName = getApiLimitDisplayName(entry.scope);
 		entries.push({
@@ -549,7 +547,7 @@ function buildScopedWeeklyUsageLimits(entries: readonly ParsedApiLimitEntry[]): 
 			label: `Claude 7 Day (${entry.displayName})`,
 			windowId: "7d",
 			windowLabel: "7 Day",
-			durationMs: SEVEN_DAYS_MS,
+			durationMs: WEEK_MS,
 			bucket: entry.bucket,
 			provider: "anthropic",
 			tier: slug,
@@ -569,7 +567,7 @@ export function parseClaudeRateLimitHeaders(headers: Record<string, string>, now
 			label: "Claude 5 Hour",
 			windowId: "5h",
 			windowLabel: "5 Hour",
-			durationMs: FIVE_HOURS_MS,
+			durationMs: 5 * HOUR_MS,
 			bucket: fiveHour,
 			provider: "anthropic",
 			shared: true,
@@ -579,7 +577,7 @@ export function parseClaudeRateLimitHeaders(headers: Record<string, string>, now
 			label: "Claude 7 Day",
 			windowId: "7d",
 			windowLabel: "7 Day",
-			durationMs: SEVEN_DAYS_MS,
+			durationMs: WEEK_MS,
 			bucket: sevenDay,
 			provider: "anthropic",
 			shared: true,
@@ -589,7 +587,7 @@ export function parseClaudeRateLimitHeaders(headers: Record<string, string>, now
 			label: "Claude 7 Day (Fable)",
 			windowId: "7d",
 			windowLabel: "7 Day",
-			durationMs: SEVEN_DAYS_MS,
+			durationMs: WEEK_MS,
 			bucket: modelScopedSevenDay,
 			provider: "anthropic",
 			tier: "fable",
@@ -633,7 +631,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 			label: "Claude 5 Hour",
 			windowId: "5h",
 			windowLabel: "5 Hour",
-			durationMs: FIVE_HOURS_MS,
+			durationMs: 5 * HOUR_MS,
 			bucket: fiveHour,
 			provider: "anthropic",
 			shared: true,
@@ -643,7 +641,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 			label: "Claude 7 Day",
 			windowId: "7d",
 			windowLabel: "7 Day",
-			durationMs: SEVEN_DAYS_MS,
+			durationMs: WEEK_MS,
 			bucket: sevenDay,
 			provider: "anthropic",
 			shared: true,
@@ -653,7 +651,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 			label: "Claude 7 Day (Opus)",
 			windowId: "7d",
 			windowLabel: "7 Day",
-			durationMs: SEVEN_DAYS_MS,
+			durationMs: WEEK_MS,
 			bucket: sevenDayOpus,
 			provider: "anthropic",
 			tier: "opus",
@@ -663,7 +661,7 @@ async function fetchClaudeUsage(params: UsageFetchParams, ctx: UsageFetchContext
 			label: "Claude 7 Day (Sonnet)",
 			windowId: "7d",
 			windowLabel: "7 Day",
-			durationMs: SEVEN_DAYS_MS,
+			durationMs: WEEK_MS,
 			bucket: sevenDaySonnet,
 			provider: "anthropic",
 			tier: "sonnet",
@@ -769,7 +767,7 @@ function rankingUsedFraction(limit: UsageLimit): number {
 
 function rankingDrainRate(limit: UsageLimit, nowMs: number): number {
 	const usedFraction = rankingUsedFraction(limit);
-	const durationMs = limit.window?.durationMs ?? SEVEN_DAYS_MS;
+	const durationMs = limit.window?.durationMs ?? WEEK_MS;
 	if (!Number.isFinite(durationMs) || durationMs <= 0) return usedFraction;
 	const resetAt = limit.window?.resetsAt;
 	if (typeof resetAt !== "number" || !Number.isFinite(resetAt)) return usedFraction;

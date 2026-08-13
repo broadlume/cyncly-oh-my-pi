@@ -217,11 +217,11 @@ export class ChildProcess<In extends InMask = InMask> {
 		return this;
 	}
 
-	kill(reason?: Exception) {
+	kill(reason?: Exception, gracefulMs?: number) {
 		if (reason && !this.#exitReasonPending) this.#exitReasonPending = reason;
 		if (!this.proc.killed)
 			void Process.fromPid(this.proc.pid)
-				?.terminate()
+				?.terminate(gracefulMs === undefined ? undefined : { gracefulMs })
 				?.catch(e => void e);
 	}
 
@@ -309,6 +309,7 @@ export class ChildProcess<In extends InMask = InMask> {
 
 	attachTimeout(ms: number): void {
 		if (ms <= 0 || this.proc.killed) return;
+		this.#exited.catch(() => {});
 		Promise.race([
 			Bun.sleep(ms).then(() => true),
 			this.proc.exited.then(
