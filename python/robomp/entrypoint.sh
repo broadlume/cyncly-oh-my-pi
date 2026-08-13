@@ -4,7 +4,7 @@
 #
 # Used by both the orchestrator (CMD: `python -m robomp serve`) and the
 # sibling gh-proxy (compose command: `python -m robomp.proxy serve`). The
-# proxy role does NOT need a $PI_ROOT pi checkout — it never runs omp.
+# proxy role never runs omp.
 set -euo pipefail
 
 # Shared git metadata under /data/workspaces/_pool is intentionally group
@@ -35,12 +35,6 @@ done
 
 if [ "$is_proxy_role" -eq 1 ]; then
     exec "$@"
-fi
-
-: "${PI_ROOT:=/work/pi}"
-if [ ! -d "$PI_ROOT/packages/coding-agent" ]; then
-    echo "roboomp: PI_ROOT=$PI_ROOT does not look like a pi checkout (no packages/coding-agent/)" >&2
-    exit 1
 fi
 
 mkdir -p /data/workspaces /data/workspaces/_pool /data/logs

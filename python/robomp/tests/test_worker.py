@@ -630,7 +630,7 @@ async def test_run_rpc_sends_reminder_when_pr_class_quits_early(tmp_path: Path, 
     # kickoff + 2 reminders (default ROBOMP_TASK_COMPLETION_MAX_REMINDERS=2)
     assert len(fake.prompts) == 1 + settings.task_completion_max_reminders
     assert fake.prompts[0] == "kickoff"
-    assert all("terminal action" in p.lower() or "open the pr" in p.lower() for p in fake.prompts[1:])
+    assert all("turn-ending action" in p.lower() for p in fake.prompts[1:])
 
 
 @pytest.mark.asyncio

@@ -300,9 +300,8 @@ def ensure_workspace_dependencies(bindings: ToolBindings) -> None:
     ``bun test``/``bun check`` the agent runs fails instantly with "Cannot find
     package" — the agent then reports it could not verify. We install before
     the agent starts, mirroring how the natives cache pre-populates ``.node``
-    artifacts. The links resolve into *this* worktree's ``packages/*`` (not the
-    orchestrator's read-only ``/work/pi``), so tests exercise the PR's edited
-    source.
+    artifacts. The links resolve into *this* worktree's own ``packages/*``,
+    so tests exercise the PR's edited source.
 
     ``--frozen-lockfile`` keeps the lockfile pristine (no spurious diff for the
     agent to commit) and ``--ignore-scripts`` skips lifecycle scripts so an

@@ -29,25 +29,22 @@ an internet-facing Application Load Balancer.
 2. An **ACM certificate in the same region as the stack** (for the ALB).
    ACM certs are regional — a `us-east-2` cert cannot attach to a `us-east-1` ALB.
    Match `CDK_DEFAULT_REGION` / `aws configure get region` to the cert ARN region.
-3. A GHCR-published robomp image built from this fork (pi source baked in).
+3. A GHCR-published robomp image built from this repo (omp binary pulled from upstream releases).
 4. After deploy: fill the Secrets Manager JSON (`REPLACE_ME` keys).
 
 ## Build & push the robomp image (GHCR)
 
-From the monorepo root (amd64 for the default `m6i` instance):
+From the repo root (amd64 for the default `m6i` instance):
 
 ```bash
 export GHCR_OWNER=epfister-cyncly
 export TAG=$(git rev-parse --short HEAD)
 
-# 1) pi runtime base (bakes /pi source)
-docker build --platform linux/amd64 -t ghcr.io/$GHCR_OWNER/pi:$TAG .
-
-# 2) robomp on top — override PI_ROOT default at runtime via compose.aws
-docker build --platform linux/amd64   -f Dockerfile.robomp   --build-arg PI_BASE=ghcr.io/$GHCR_OWNER/pi:$TAG   -t ghcr.io/$GHCR_OWNER/robomp:$TAG   -t ghcr.io/$GHCR_OWNER/robomp:latest   .
+docker build --platform linux/amd64 -f Dockerfile.robomp \
+  --build-arg OMP_VERSION=v17.3.1 \
+  -t ghcr.io/$GHCR_OWNER/robomp:$TAG -t ghcr.io/$GHCR_OWNER/robomp:latest .
 
 echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_OWNER" --password-stdin
-docker push ghcr.io/$GHCR_OWNER/pi:$TAG
 docker push ghcr.io/$GHCR_OWNER/robomp:$TAG
 docker push ghcr.io/$GHCR_OWNER/robomp:latest
 ```
@@ -106,5 +103,5 @@ infra/cdk/robomp/
   assets/                 # baked into instance user-data at synth time
 python/robomp/
   docker-compose.yml      # base (gh-proxy isolation unchanged)
-  docker-compose.aws.yml  # GHCR image + LiteLLM + PI_ROOT=/pi
+  docker-compose.aws.yml  # GHCR image + LiteLLM
 ```

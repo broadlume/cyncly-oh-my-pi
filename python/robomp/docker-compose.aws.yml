@@ -42,8 +42,6 @@ services:
       ROBOMP_LOG_DIR: /data/logs
       ROBOMP_BIND_HOST: ${ROBOMP_BIND_HOST:-0.0.0.0}
       ROBOMP_BIND_PORT: ${ROBOMP_BIND_PORT:-8080}
-      # Baked into the GHCR image from pi-runtime (/pi). Do not mount a host checkout.
-      PI_ROOT: /pi
     depends_on:
       gh-proxy:
         condition: service_started

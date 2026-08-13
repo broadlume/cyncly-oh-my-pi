@@ -47,11 +47,10 @@ into the `tool_calls` table with credential-redacted args and results.
 ## Setup
 
 Requires Docker Compose v2 and a LiteLLM-style proxy on the host that your
-`~/.omp/agent/models.container.yml` points at (mounted into the container as `models.yml`; kept under a separate filename on the host so the host omp doesn't route through the gateway). roboomp lives inside the oh-my-pi
-monorepo at `python/robomp/`; both the docker build context and the
-`/work/pi` bind mount default to the parent monorepo (`../..`). Override
-`PI_ROOT` only if you want a different oh-my-pi checkout backing the build
-and runtime.
+`~/.omp/agent/models.container.yml` points at (mounted into the container as `models.yml`; kept under a separate filename on the host so the host omp doesn't route through the gateway). The image is self-contained: it
+builds the dashboard bundle and the omp_rpc wheel from this repo and bakes
+the upstream `omp` release binary (pinned by the `OMP_VERSION` build-arg in
+`Dockerfile.robomp`).
 
 Bot account needs **Write** on every repo in `ROBOMP_REPO_ALLOWLIST`. A
 fine-grained PAT with Contents / Issues / Pull requests RW + Metadata R is
@@ -63,8 +62,8 @@ $EDITOR .env
 openssl rand -hex 32              # ROBOMP_GH_PROXY_HMAC_KEY
 openssl rand -hex 32              # GITHUB_WEBHOOK_SECRET
 
-bun run pi:image                  # build oh-my-pi/pi:dev (one-time / on pi change)
-bun run robomp:build && bun run robomp:up
+cd python/robomp && docker compose build
+docker compose up -d
 curl -fsS http://localhost:8080/healthz
 ```
 
@@ -75,8 +74,8 @@ comment out `ROBOMP_GH_PROXY_URL` / `ROBOMP_GH_PROXY_HMAC_KEY` and set
 rejects a `.env` setting both).
 
 Build invalidation is bounded: editing roboomp Python touches only the
-runtime layer; editing pi source rebuilds `oh-my-pi/pi:dev`, which
-roboomp's `Dockerfile.robomp` extends via `FROM ${PI_BASE}`.
+runtime layer; the web bundle and omp_rpc wheel rebuild only when their
+sources change.
 
 ### AWS (hardened EC2 + ALB)
 
@@ -115,9 +114,8 @@ docker compose exec robomp robomp status                   # dump issues table
 docker compose exec robomp robomp cleanup owner/repo#123   # force workspace removal, state=abandoned
 ```
 
-`bun run robomp:…` shortcuts in the root `package.json` cover the common
-lifecycle commands (`robomp:dev`, `robomp:build`, `robomp:up`, `robomp:down`,
-`robomp:logs`, `robomp:restart`, `robomp:reset`).
+Lifecycle commands run through Docker Compose from `python/robomp/`
+(`docker compose build`, `up -d`, `down`, `logs -f`, `restart`).
 
 ## Tests
 
@@ -128,7 +126,7 @@ ROBOMP_INTEGRATION=1 pytest -x tests/test_worker_smoke.py
 
 The integration test spawns a real `omp --mode rpc` against an
 `httpx.MockTransport` GitHub and a local bare repo, so it needs `omp` on
-`PATH`. `bun run test:py` runs the unit suite.
+`PATH`.
 
 ## Security posture
 
@@ -188,12 +186,11 @@ The integration test spawns a real `omp --mode rpc` against an
 | Symptom | Check |
 |---|---|
 | `401 invalid signature` | `GITHUB_WEBHOOK_SECRET` mismatch with the repo webhook config. |
-| Container exits with `PI_ROOT … missing` | `/work/pi` mount empty inside the container; on the host either run `docker compose` from `python/robomp/` so `PI_ROOT` defaults to `../..`, or export `PI_ROOT` to a valid oh-my-pi checkout. |
 | `git push: Authentication required` | Bot PAT lacks push, or `ROBOMP_BOT_LOGIN` does not identify the PAT account's mention handle (production: `roboomp`, no `@`/`[bot]`). |
 | `refusing to push: commit author identity mismatch` | Some commit not authored as `ROBOMP_GIT_AUTHOR_*`. The error lists the offending shas; `git commit --amend --reset-author --no-edit`. |
 | `refusing to push: working tree is dirty` | Uncommitted agent edits. Or just call `gh_open_pr`, which auto-commits `bun run fix` output. |
 | `bun check failed before PR creation` | Fix the reported failure and retry `gh_open_pr`. |
-| `Failed to load pi_natives` | Wrong arch / missing native. `bun run pi:image` then `bun run robomp:build`. |
+| `Failed to load pi_natives` | Wrong arch / missing native. `cd python/robomp && docker compose build` and restart. |
 | `No API key found for <provider>` | `~/.omp/agent/models.container.yml` mount missing or provider id mismatch with `ROBOMP_MODEL`. |
 
 ## Layout

@@ -2,46 +2,96 @@
 ###############################################################################
 # robomp — GitHub triage+fix bot orchestrator.
 #
-# Extends `pi-base` (from /Dockerfile, default target oh-my-pi/pi:dev) and adds
-# the robomp Python package + a Vite-built SolidJS dashboard bundle. The pi
-# toolchain (python + bun + rustup launcher + pi-natives + omp_rpc wheel +
-# /usr/local/bin/omp shim) all comes from PI_BASE; this file only layers what's
-# robomp-specific.
+# Self-contained image: builds the SolidJS dashboard bundle and the omp_rpc
+# wheel from this repo, and downloads the prebuilt `omp` binary from upstream
+# can1357/oh-my-pi GitHub releases (pinned by OMP_VERSION). No base image
+# from a monorepo source build.
 #
-# Build (from pi root):
-#     bun run pi:image                              # build oh-my-pi/pi:dev first
+# Build (from repo root):
 #     docker build -f Dockerfile.robomp -t robomp:dev .
 #
 # Compose (recommended):
 #     docker compose --project-directory python/robomp build
 ###############################################################################
 
-ARG PI_BASE=oh-my-pi/pi:dev
 ARG BUN_VERSION=1.3.14
+ARG OMP_VERSION=v17.3.1
 
 ############################
 # 1) web-builder — Bun + Vite, builds the SolidJS dashboard bundle.
 ############################
 FROM oven/bun:${BUN_VERSION}-slim AS web-builder
-WORKDIR /work
-# Root manifests + the web workspace manifest are enough for `bun install
-# --filter robomp-web` to hydrate just the dashboard's node_modules.
-COPY package.json bun.lock ./
-COPY python/robomp/web/package.json ./python/robomp/web/package.json
-# Root package.json declares patchedDependencies, so the patch file must be
-# present before any root-level `bun install` (even a filtered one).
-COPY patches/*.patch ./patches/
-RUN bun install --filter robomp-web
-COPY --exclude=node_modules --exclude=dist python/robomp/web/ ./python/robomp/web/
-RUN bun --cwd=python/robomp/web run build
+WORKDIR /work/web
+COPY python/robomp/web/package.json python/robomp/web/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY --exclude=node_modules --exclude=dist python/robomp/web/ ./
+RUN bun run build
 
 ############################
-# 2) runtime — pi-base + robomp src + web bundle + pip install
+# 2) wheel-builder — builds the omp_rpc wheel.
 ############################
-FROM ${PI_BASE} AS runtime
+FROM python:3.12-slim-bookworm AS wheel-builder
+RUN pip install --upgrade pip build
+WORKDIR /src
+COPY python/omp-rpc /src
+RUN python -m build --wheel --outdir /out
 
-# robomp runs against the host pi checkout mounted at /work/pi read-only.
-ENV PI_ROOT=/work/pi
+############################
+# 3) runtime — python + bun + rustup launcher + upstream omp binary + robomp
+############################
+FROM python:3.12-slim-bookworm AS runtime
+
+ARG BUN_VERSION
+ARG OMP_VERSION
+ARG TARGETARCH
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    BUN_INSTALL=/opt/bun \
+    CARGO_HOME=/data/cache/cargo \
+    CARGO_TARGET_DIR=/data/cache/cargo-target \
+    RUSTUP_HOME=/data/cache/rustup \
+    PATH=/opt/bun/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates unzip openssh-client tini sqlite3 \
+        build-essential pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
+    && /opt/bun/bin/bun --version
+
+# Rustup launcher only — the real toolchain is fetched lazily into RUSTUP_HOME
+# on first cargo invocation. Keeps the image small while sharing the toolchain
+# across reboots when /data is mounted.
+RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup-bootstrap \
+       sh /tmp/rustup-init.sh -y --no-modify-path --default-toolchain none --profile minimal \
+    && rm -f /tmp/rustup-init.sh \
+    && rm -rf /usr/local/rustup-bootstrap \
+    && /usr/local/cargo/bin/rustup --version
+
+# Upstream omp release binary (self-contained compiled build).
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) omp_arch=x64 ;; \
+      arm64) omp_arch=arm64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/can1357/oh-my-pi/releases/download/${OMP_VERSION}"; \
+    curl -fsSL -o /usr/local/bin/omp "${base}/omp-linux-${omp_arch}"; \
+    curl -fsSL -o /tmp/SHA256SUMS.txt "${base}/SHA256SUMS.txt"; \
+    expected="$(awk -v a="omp-linux-${omp_arch}" '$2 == a || $2 == "*"a { print $1 }' /tmp/SHA256SUMS.txt)"; \
+    test -n "${expected}"; \
+    echo "${expected}  /usr/local/bin/omp" | sha256sum -c -; \
+    chmod +x /usr/local/bin/omp; \
+    rm -f /tmp/SHA256SUMS.txt; \
+    /usr/local/bin/omp --version
+
+COPY --from=wheel-builder /out/*.whl /tmp/wheels/
+RUN pip install --no-cache-dir /tmp/wheels/omp_rpc-*.whl && rm -rf /tmp/wheels
 
 WORKDIR /app
 
@@ -50,7 +100,7 @@ WORKDIR /app
 # as package-data in pyproject.toml).
 COPY python/robomp/pyproject.toml ./
 COPY python/robomp/src/ ./src/
-COPY --from=web-builder /work/python/robomp/web/dist/ ./src/static/
+COPY --from=web-builder /work/web/dist/ ./src/static/
 
 RUN pip install --no-cache-dir \
         "fastapi>=0.112" "uvicorn[standard]>=0.30" "httpx>=0.27" \
