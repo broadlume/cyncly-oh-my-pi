@@ -80,7 +80,7 @@ async def test_dispatch_routes_issue_triage_actions_to_triage_issue(
     assert seen == [action]
 
 
-@pytest.mark.parametrize("action", ["opened", "reopened", "ready_for_review"])
+@pytest.mark.parametrize("action", ["review_requested", "ready_for_review"])
 @pytest.mark.asyncio
 async def test_dispatch_routes_pr_review_actions_to_review_pr(
     settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch, action: str
@@ -98,9 +98,10 @@ async def test_dispatch_routes_pr_review_actions_to_review_pr(
     assert seen == [action]
 
 
+@pytest.mark.parametrize("action", ["synchronize", "opened"])
 @pytest.mark.asyncio
-async def test_dispatch_pr_synchronize_is_noop(
-    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
+async def test_dispatch_non_review_pr_actions_are_noop(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
     """Actions `route` never queues for review must NOT spawn a review task."""
     called = False
@@ -111,7 +112,7 @@ async def test_dispatch_pr_synchronize_is_noop(
 
     monkeypatch.setattr(tasks, "review_pr", fake_review_pr)
 
-    await _make_pool(settings, db)._dispatch(_pr_row("synchronize"))  # noqa: SLF001
+    await _make_pool(settings, db)._dispatch(_pr_row(action))  # noqa: SLF001
 
     assert called is False
 

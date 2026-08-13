@@ -9,7 +9,7 @@ from robomp.github_events import (
     extract_mention,
     is_implementation_authorizer,
     is_maintainer,
-    is_rereview_request,
+    is_review_request,
     rate_limit_cap,
     route,
     verify_signature,
@@ -230,7 +230,7 @@ def test_route_pr_conversation_falls_back_to_pr_key_when_resolver_misses() -> No
     assert decision.issue_key == "octo/widget#9"
 
 
-def test_route_incoming_pr_opened_queues_review_pr() -> None:
+def test_route_pr_opened_no_longer_queues_review() -> None:
     decision = route(
         "pull_request",
         {
@@ -246,6 +246,32 @@ def test_route_incoming_pr_opened_queues_review_pr() -> None:
         allowlist=ALLOWLIST,
         bot_login=BOT,
     )
+    assert not decision.should_queue
+    assert "not handled" in decision.reason
+
+
+def _review_requested_payload(reviewer: str, **pr_extra: object) -> dict[str, object]:
+    return {
+        "action": "review_requested",
+        "requested_reviewer": {"login": reviewer},
+        "pull_request": {
+            "number": 9,
+            "draft": False,
+            "user": {"login": "alice", "type": "User"},
+            "author_association": "CONTRIBUTOR",
+            **pr_extra,
+        },
+        "repository": {"full_name": "octo/widget"},
+    }
+
+
+def test_route_review_requested_for_bot_queues_review_pr() -> None:
+    decision = route(
+        "pull_request",
+        _review_requested_payload(BOT),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
     assert decision.should_queue
     assert decision.task == "review_pr"
     assert decision.issue_key == "octo/widget#9"
@@ -253,22 +279,78 @@ def test_route_incoming_pr_opened_queues_review_pr() -> None:
     assert decision.association == "CONTRIBUTOR"
 
 
-def test_route_incoming_pr_opened_skips_draft_bot_and_disabled() -> None:
-    payload = {
-        "action": "opened",
-        "pull_request": {"number": 9, "draft": True, "user": {"login": "alice", "type": "User"}},
-        "repository": {"full_name": "octo/widget"},
-    }
-    assert not route("pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT).should_queue
+def test_route_review_requested_for_other_reviewer_skips() -> None:
+    decision = route(
+        "pull_request",
+        _review_requested_payload("alice"),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "review requested for someone else"
 
-    payload["pull_request"]["draft"] = False  # type: ignore[index]
-    payload["pull_request"]["user"] = {"login": BOT, "type": "Bot"}  # type: ignore[index]
-    assert not route("pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT).should_queue
 
-    payload["pull_request"]["user"] = {"login": "alice", "type": "User"}  # type: ignore[index]
-    disabled = route("pull_request", payload, allowlist=ALLOWLIST, bot_login=BOT, pr_review_enabled=False)
+def test_route_review_requested_on_draft_skips() -> None:
+    decision = route(
+        "pull_request",
+        _review_requested_payload(BOT, draft=True),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "draft PR"
+
+
+def test_route_review_requested_skips_bot_authored_and_disabled() -> None:
+    bot_authored = _review_requested_payload(BOT, user={"login": BOT, "type": "Bot"})
+    assert not route("pull_request", bot_authored, allowlist=ALLOWLIST, bot_login=BOT).should_queue
+
+    disabled = route(
+        "pull_request",
+        _review_requested_payload(BOT),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        pr_review_enabled=False,
+    )
     assert not disabled.should_queue
     assert "disabled" in disabled.reason
+
+
+def _ready_payload(requested_reviewers: list[dict[str, str]]) -> dict[str, object]:
+    return {
+        "action": "ready_for_review",
+        "pull_request": {
+            "number": 9,
+            "draft": False,
+            "user": {"login": "alice", "type": "User"},
+            "author_association": "CONTRIBUTOR",
+            "requested_reviewers": requested_reviewers,
+        },
+        "repository": {"full_name": "octo/widget"},
+    }
+
+
+def test_route_ready_for_review_with_bot_reviewer_queues() -> None:
+    decision = route(
+        "pull_request",
+        _ready_payload([{"login": "alice"}, {"login": BOT}]),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.should_queue
+    assert decision.task == "review_pr"
+    assert decision.issue_key == "octo/widget#9"
+
+
+def test_route_ready_for_review_without_bot_reviewer_skips() -> None:
+    decision = route(
+        "pull_request",
+        _ready_payload([]),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "bot not a requested reviewer"
 
 
 def test_route_pull_request_synchronize_stays_skipped() -> None:
@@ -323,6 +405,47 @@ def test_route_incoming_pr_comment_with_maintainer_rereview_queues_review_pr() -
     assert decision.directive is True
     assert decision.directive_body == "please re-review"
     assert "re-review" in decision.reason
+
+
+def test_route_incoming_pr_comment_with_maintainer_plain_review_queues_review_pr() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "can1357"},
+                "author_association": "OWNER",
+                "body": f"@{BOT} review",
+            },
+            "issue": {"number": 9, "user": {"login": "contributor"}, "pull_request": {"url": "x"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert decision.should_queue
+    assert decision.task == "review_pr"
+    assert decision.directive_body == "review"
+
+
+def test_route_incoming_pr_comment_review_from_non_maintainer_ignored() -> None:
+    decision = route(
+        "issue_comment",
+        {
+            "action": "created",
+            "comment": {
+                "user": {"login": "randomdev"},
+                "author_association": "NONE",
+                "body": f"@{BOT} review",
+            },
+            "issue": {"number": 9, "user": {"login": "contributor"}, "pull_request": {"url": "x"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "incoming PR comments ignored"
 
 
 def test_route_incoming_pr_comment_with_maintainer_non_rereview_still_skips() -> None:
@@ -579,14 +702,20 @@ def test_rate_limit_cap_default_tier_for_unknown_and_first_timer() -> None:
         ("rereview this", True),
         ("can you review again?", True),
         ("please review this again", True),
+        ("review", True),
+        ("please review", True),
+        ("review this", True),
+        ("review the naming", True),
         ("what do you think?", False),
-        ("review the naming", False),
+        ("reviewed it already", False),
+        ("the reviewer said no", False),
+        ("overview", False),
         ("", False),
         (None, False),
     ],
 )
-def test_is_rereview_request(body: str | None, expected: bool) -> None:
-    assert is_rereview_request(body) is expected
+def test_is_review_request(body: str | None, expected: bool) -> None:
+    assert is_review_request(body) is expected
 
 
 

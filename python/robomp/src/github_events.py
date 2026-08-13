@@ -193,21 +193,18 @@ def is_implementation_authorizer(
     return False
 
 
-_REREVIEW_RE = re.compile(
-    r"\b(?:re[- ]?review|review(?:\s+this)?\s+again)\b",
-    re.IGNORECASE,
-)
+_REVIEW_REQUEST_RE = re.compile(r"\b(?:re[- ]?)?review\b", re.IGNORECASE)
 
 
-def is_rereview_request(body: str | None) -> bool:
-    """True when a directive body explicitly asks for another PR review pass.
+def is_review_request(body: str | None) -> bool:
+    """True when a directive body explicitly asks for a PR review pass.
 
-    Conservative on purpose: only an explicit re-review phrase re-runs Phase 1+2.
-    Ordinary maintainer questions on incoming PRs stay ignored.
+    Fires on any explicit `review` keyword (including `re-review`) in a
+    directive body. Ordinary maintainer questions on incoming PRs stay ignored.
     """
     if not isinstance(body, str) or not body.strip():
         return False
-    return _REREVIEW_RE.search(body) is not None
+    return _REVIEW_REQUEST_RE.search(body) is not None
 
 
 def _pr_review_pr(pr: Mapping[str, Any], repo: str, action: str, bot_login: str) -> RouteDecision:
@@ -360,7 +357,7 @@ def route(
                     **_directive_kwargs(comment, login, assoc),
                 )
             directive_kw = _directive_kwargs(comment, login, assoc)
-            if directive_kw.get("directive") and is_rereview_request(directive_kw.get("directive_body")):
+            if directive_kw.get("directive") and is_review_request(directive_kw.get("directive_body")):
                 if not pr_review_enabled:
                     return RouteDecision("skip", None, repo, issue_key(repo, number), "PR review disabled")
                 return RouteDecision(
@@ -388,10 +385,25 @@ def route(
             **_directive_kwargs(comment, login, assoc),
         )
 
-    if event_type == "pull_request" and action in ("opened", "reopened", "ready_for_review"):
+    if event_type == "pull_request" and action == "review_requested":
+        if not pr_review_enabled:
+            return RouteDecision("skip", None, repo, None, "PR review disabled")
+        reviewer = payload.get("requested_reviewer") or {}
+        if not _login_matches_bot(str(reviewer.get("login") or ""), bot_login):
+            return RouteDecision("skip", None, repo, None, "review requested for someone else")
+        pr = payload.get("pull_request") or {}
+        return _pr_review_pr(pr, repo, action, bot_login)
+
+    if event_type == "pull_request" and action == "ready_for_review":
         if not pr_review_enabled:
             return RouteDecision("skip", None, repo, None, "PR review disabled")
         pr = payload.get("pull_request") or {}
+        requested = pr.get("requested_reviewers") or []
+        if not any(
+            isinstance(u, Mapping) and _login_matches_bot(str(u.get("login") or ""), bot_login)
+            for u in requested
+        ):
+            return RouteDecision("skip", None, repo, None, "bot not a requested reviewer")
         return _pr_review_pr(pr, repo, action, bot_login)
 
     if event_type == "pull_request_review_comment" and action == "created":
@@ -466,7 +478,7 @@ __all__ = [
     "extract_mention",
     "is_maintainer",
     "is_implementation_authorizer",
-    "is_rereview_request",
+    "is_review_request",
     "rate_limit_cap",
     "route",
     "verify_signature",

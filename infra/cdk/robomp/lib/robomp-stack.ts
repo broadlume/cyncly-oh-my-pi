@@ -42,7 +42,8 @@ export interface RobompStackProps extends cdk.StackProps {
  * - No SSM Session Manager permissions
  * - IMDSv2 required, hop limit 1 (containers cannot reach IMDS)
  * - EBS encrypted with the stack CMK
- * - ALB exposes only `/webhook/github` on HTTPS; `/healthz` is ALB-only
+ * - ALB exposes `/webhook/github` on HTTPS (plus the dashboard paths for
+ *   `dashboardAllowCidrs` source IPs); `/healthz` is ALB-only
  */
 export class RobompStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: RobompStackProps) {
@@ -336,6 +337,24 @@ export class RobompStack extends cdk.Stack {
       targetGroups: [targetGroup],
     });
 
+    // Dashboard: read-only web panel, exposed only to allowlisted source IPs
+    // (e.g. the VPN egress). No context value → no rule, webhook-only ALB.
+    // Comma-separated CIDRs via `-c dashboardAllowCidrs=a.b.c.d/32,...`.
+    const dashboardAllowCidrs = (this.node.tryGetContext("dashboardAllowCidrs") as string | undefined)
+      ?.split(",")
+      .map((cidr) => cidr.trim())
+      .filter(Boolean);
+    if (dashboardAllowCidrs?.length) {
+      httpsListener.addTargetGroups("Dashboard", {
+        priority: 20,
+        conditions: [
+          elbv2.ListenerCondition.pathPatterns(["/", "/static/*", "/api/*"]),
+          elbv2.ListenerCondition.sourceIps(dashboardAllowCidrs),
+        ],
+        targetGroups: [targetGroup],
+      });
+    }
+
     const webAcl = new wafv2.CfnWebACL(this, "WebAcl", {
       defaultAction: { allow: {} },
       scope: "REGIONAL",
@@ -354,6 +373,13 @@ export class RobompStack extends cdk.Stack {
             managedRuleGroupStatement: {
               vendorName: "AWS",
               name: "AWSManagedRulesCommonRuleSet",
+              // GitHub webhook payloads (issue/PR bodies) routinely exceed the
+              // 8KB body-size cap and got blocked with a bare ALB 403. The
+              // endpoint is HMAC-authenticated (X-Hub-Signature-256), so the
+              // size cap adds nothing here; count instead of block.
+              ruleActionOverrides: [
+                { name: "SizeRestrictions_BODY", actionToUse: { count: {} } },
+              ],
             },
           },
           visibilityConfig: {
@@ -429,6 +455,13 @@ export class RobompStack extends cdk.Stack {
     };
 
     userData.addCommands("set -euo pipefail", "mkdir -p /opt/robomp /etc/robomp/rules");
+    // Secret values are read once at first boot. Bump `-c provisionNonce=<n>`
+    // to change the user-data hash and force an instance replacement (and thus
+    // a re-read of the secret) without any other change.
+    const provisionNonce = this.node.tryGetContext("provisionNonce");
+    if (provisionNonce) {
+      userData.addCommands(`# provision-nonce: ${provisionNonce}`);
+    }
     writeFile("/opt/robomp/docker-compose.aws.yml", composeAws);
     writeFile("/etc/robomp/models.container.yml.tmpl", modelsTmpl);
     writeFile("/etc/robomp/litellm.config.yaml", litellmCfg);
@@ -444,6 +477,12 @@ export class RobompStack extends cdk.Stack {
       role,
       securityGroup: instanceSg,
       userData,
+      // Re-provisioning path: cloud-init only runs once per instance id, and
+      // the instance has no SSM/SSH access. Any user-data change (e.g. a new
+      // image tag) must replace the instance so the bootstrap re-runs against
+      // the current secret. Data survives on the non-delete-on-termination
+      // EBS volume.
+      userDataCausesReplacement: true,
       blockDevices: [
         {
           deviceName: "/dev/xvda",

@@ -13,7 +13,7 @@ from robomp import tasks
 from robomp.cancellation import clear_current_event, set_current_event
 from robomp.config import Settings
 from robomp.db import Database, EventRow
-from robomp.github_events import is_rereview_request
+from robomp.github_events import is_review_request
 from robomp.github_backend import GitHubBackend
 from robomp.sandbox import GitTransport, SandboxManager, _reap_slot
 from robomp.slot_pool import SlotPool
@@ -404,7 +404,7 @@ class WorkerPool:
                     raw_body = directive.get("body")
                     if isinstance(raw_body, str):
                         directive_body = raw_body
-                if directive_body is not None and is_rereview_request(directive_body):
+                if directive_body is not None and is_review_request(directive_body):
                     await tasks.review_pr(
                         settings=self.settings,
                         db=self.db,
@@ -441,7 +441,7 @@ class WorkerPool:
                     attempts=row.attempts,
                     slot_uid=slot_uid,
                 )
-        elif event == "pull_request" and action in ("opened", "reopened", "ready_for_review", "labeled"):
+        elif event == "pull_request" and action in ("review_requested", "ready_for_review"):
             await tasks.review_pr(
                 settings=self.settings,
                 db=self.db,

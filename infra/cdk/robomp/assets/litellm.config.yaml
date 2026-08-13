@@ -1,12 +1,32 @@
 # Minimal LiteLLM proxy config. Provider keys come from the container env
 # (ANTHROPIC_API_KEY / OPENAI_API_KEY / …) populated from Secrets Manager.
+#
+# omp resolves `<provider>/<id>` model refs and sends the BARE id to the
+# gateway (verified empirically: bare names are what arrive at /v1/messages).
+# LiteLLM matches model_name exactly, so every model needs a bare-name entry;
+# the prefixed entries are kept for clients that send fully-qualified names.
 model_list:
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: anthropic/claude-opus-4-6
+  - model_name: claude-opus-5
+    litellm_params:
+      model: anthropic/claude-opus-5
+  - model_name: gpt-5
+    litellm_params:
+      model: openai/gpt-5
   - model_name: anthropic/claude-sonnet-4-6
     litellm_params:
       model: anthropic/claude-sonnet-4-6
   - model_name: anthropic/claude-opus-4-6
     litellm_params:
       model: anthropic/claude-opus-4-6
+  - model_name: anthropic/claude-opus-5
+    litellm_params:
+      model: anthropic/claude-opus-5
   - model_name: openai/gpt-5
     litellm_params:
       model: openai/gpt-5
