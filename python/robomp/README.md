@@ -46,11 +46,17 @@ into the `tool_calls` table with credential-redacted args and results.
 
 ## Setup
 
-Requires Docker Compose v2 and a LiteLLM-style proxy on the host that your
-`~/.omp/agent/models.container.yml` points at (mounted into the container as `models.yml`; kept under a separate filename on the host so the host omp doesn't route through the gateway). The image is self-contained: it
-builds the dashboard bundle and the omp_rpc wheel from this repo and bakes
-the upstream `omp` release binary (pinned by the `OMP_VERSION` build-arg in
-`Dockerfile.robomp`).
+Requires Docker Compose v2 and a LiteLLM-style proxy on the host. Put the agent
+config the container should use in `python/robomp/agent-home-local/` (or point
+`ROBOMP_AGENT_HOME_OVERRIDE` at another tree): `.omp/agent/models.yml` for
+gateway routing and `.agent/AGENTS.md` for instructions. That tree is layer 2;
+it is kept out of the host's own `~/.omp/agent/` so the host omp does not route
+through the gateway. Layer 1 — skills, subagents, base `config.yml`/`mcp.json`,
+base rules — is baked into the image from
+`infra/cdk/robomp/assets/agent-bundle/`; see `infra/cdk/robomp/README.md`. The
+image is self-contained: it builds the dashboard bundle and the omp_rpc wheel
+from this repo and bakes the upstream `omp` release binary (pinned by the
+`OMP_VERSION` build-arg in `Dockerfile.robomp`).
 
 Bot account needs **Write** on every repo in `ROBOMP_REPO_ALLOWLIST`. A
 fine-grained PAT with Contents / Issues / Pull requests RW + Metadata R is
@@ -191,7 +197,7 @@ The integration test spawns a real `omp --mode rpc` against an
 | `refusing to push: working tree is dirty` | Uncommitted agent edits. Or just call `gh_open_pr`, which auto-commits `bun run fix` output. |
 | `bun check failed before PR creation` | Fix the reported failure and retry `gh_open_pr`. |
 | `Failed to load pi_natives` | Wrong arch / missing native. `cd python/robomp && docker compose build` and restart. |
-| `No API key found for <provider>` | `~/.omp/agent/models.container.yml` mount missing or provider id mismatch with `ROBOMP_MODEL`. |
+| `No API key found for <provider>` | `agent-home-local/.omp/agent/models.yml` missing from the override tree, or provider id mismatch with `ROBOMP_MODEL`. |
 
 ## Layout
 

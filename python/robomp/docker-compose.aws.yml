@@ -52,9 +52,9 @@ services:
       - robomp_internal
     volumes:
       - robomp_data:/data
-      - /etc/robomp/models.container.yml:/srv/agent-home-stage/.omp/agent/models.yml:ro
-      - /etc/robomp/AGENT.md:/srv/agent-home-stage/.agent/AGENTS.md:ro
-      - /etc/robomp/rules:/srv/agent-home-stage/.agent/rules:ro
+      # Layer 2 override tree written by user-data. Layer 1 (skills, subagents,
+      # base config.yml/mcp.json, base rules) is baked into the image.
+      - /etc/robomp/agent-home:/srv/agent-home-override:ro
     ports:
       - "8080:8080"
 

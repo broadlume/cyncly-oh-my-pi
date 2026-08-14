@@ -296,6 +296,43 @@ def test_build_extra_env_stages_agent_home(tmp_path: Path, settings: Settings, m
     assert (agent_home / ".omp" / "agent" / "models.yml").stat().st_mode & 0o777 == 0o644
 
 
+def test_stage_agent_home_overlays_override_per_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage_home = tmp_path / "agent-home-stage"
+    override_home = tmp_path / "agent-home-override"
+    agent_home = tmp_path / "agent-home"
+    monkeypatch.setattr(worker, "_AGENT_HOME_STAGE", stage_home)
+    monkeypatch.setattr(worker, "_AGENT_HOME_OVERRIDE", override_home)
+    monkeypatch.setattr(worker, "_AGENT_HOME", agent_home)
+
+    (stage_home / ".agent" / "rules").mkdir(parents=True)
+    (stage_home / ".agent" / "rules" / "10-baked.md").write_text("baked\n", encoding="utf-8")
+    (stage_home / ".omp" / "agent" / "skills" / "s").mkdir(parents=True)
+    (stage_home / ".omp" / "agent" / "skills" / "s" / "SKILL.md").write_text("skill\n", encoding="utf-8")
+    (stage_home / ".omp" / "agent" / "config.yml").write_text("baked: true\n", encoding="utf-8")
+
+    (override_home / ".agent" / "rules").mkdir(parents=True)
+    (override_home / ".agent" / "rules" / "00-override.md").write_text("override\n", encoding="utf-8")
+    (override_home / ".omp" / "agent").mkdir(parents=True)
+    (override_home / ".omp" / "agent" / "config.yml").write_text("baked: false\n", encoding="utf-8")
+    (override_home / ".omp" / "agent" / "models.yml").write_text("models: []\n", encoding="utf-8")
+
+    worker._stage_agent_home()
+
+    rules = agent_home / ".agent" / "rules"
+    assert sorted(p.name for p in rules.iterdir()) == ["00-override.md", "10-baked.md"]
+    omp_agent = agent_home / ".omp" / "agent"
+    assert (omp_agent / "skills" / "s" / "SKILL.md").is_file()
+    assert (omp_agent / "models.yml").is_file()
+    assert (omp_agent / "config.yml").read_text(encoding="utf-8") == "baked: false\n"
+
+    worker._stage_agent_home()
+
+    assert sorted(p.name for p in rules.iterdir()) == ["00-override.md", "10-baked.md"]
+    assert (omp_agent / "models.yml").is_file()
+
+
 @pytest.mark.asyncio
 async def test_run_rpc_omits_home_when_agent_home_absent(
     tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch

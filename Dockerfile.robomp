@@ -108,14 +108,20 @@ RUN pip install --no-cache-dir \
         "click>=8.1" \
     && pip install --no-cache-dir --no-deps .
 
-# Host agent config is mounted read-only under /srv/agent-home-stage with
-# host-controlled permissions. The entrypoint copies it into root-owned
-# world-readable files under /srv/agent-home; the agent subprocess runs with
-# HOME=/srv/agent-home, so ~/.omp and ~/.agent resolve there without exposing
-# mutable host mounts.
+# Agent config arrives in two layers: the image bundle at /srv/agent-home-stage
+# and a read-only host mount at /srv/agent-home-override. The entrypoint copies
+# layer 1 then layer 2 into root-owned world-readable files under
+# /srv/agent-home; the agent subprocess runs with HOME=/srv/agent-home, so
+# ~/.omp and ~/.agent resolve there without exposing mutable host mounts.
 RUN mkdir -p /srv/agent-home/.agent /srv/agent-home/.omp/agent \
     && mkdir -p /srv/agent-home-stage/.agent /srv/agent-home-stage/.omp/agent \
     && printf '[install]\nbackend = "copyfile"\n' > /srv/agent-home/.bunfig.toml
+
+# Versioned agent-config bundle (layer 1); its tree is a literal image of $HOME.
+# The host override mount at /srv/agent-home-override is layer 2; the entrypoint
+# and the worker copy layer 1 then layer 2 into /srv/agent-home.
+COPY infra/cdk/robomp/assets/agent-bundle/ /srv/agent-home-stage/
+RUN mkdir -p /srv/agent-home-override
 
 COPY python/robomp/entrypoint.sh /usr/local/bin/robomp-entrypoint
 RUN chmod +x /usr/local/bin/robomp-entrypoint

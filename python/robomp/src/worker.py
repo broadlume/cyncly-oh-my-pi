@@ -120,16 +120,23 @@ _SCRUBBED_ENV_KEYS: tuple[str, ...] = (
 
 _AGENT_HOME = Path("/srv/agent-home")
 _AGENT_HOME_STAGE = Path("/srv/agent-home-stage")
+_AGENT_HOME_OVERRIDE = Path("/srv/agent-home-override")
 
 
 def _stage_agent_home() -> None:
-    """Copy late-appearing staged agent config into the runtime HOME."""
-    if not _AGENT_HOME_STAGE.exists():
+    """Re-apply the layered agent config into the runtime HOME.
+
+    Layer 1 is the image bundle at ``/srv/agent-home-stage``; layer 2 is the
+    host override mount at ``/srv/agent-home-override``. Later layers win per
+    file, so an override never hides a sibling from the bundle.
+    """
+    layers = [p for p in (_AGENT_HOME_STAGE, _AGENT_HOME_OVERRIDE) if p.exists()]
+    if not layers:
         return
 
     for rel in (Path(".agent"), Path(".omp/agent")):
-        src = _AGENT_HOME_STAGE / rel
-        if not src.exists():
+        sources = [layer / rel for layer in layers if (layer / rel).exists()]
+        if not sources:
             continue
 
         dst = _AGENT_HOME / rel
@@ -139,8 +146,9 @@ def _stage_agent_home() -> None:
                     shutil.rmtree(dst)
                 else:
                     dst.unlink()
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(src, dst, dirs_exist_ok=True)
+            dst.mkdir(parents=True, exist_ok=True)
+            for src in sources:
+                shutil.copytree(src, dst, dirs_exist_ok=True)
         except OSError as exc:
             log.warning("Failed to stage agent home path %s: %s", rel, exc)
 

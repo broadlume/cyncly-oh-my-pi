@@ -5,7 +5,7 @@
 .env
 *.log
 *.tmp
-.DS_Store
+**/.DS_Store
 .vscode/
 .idea/
 infra/cdk/robomp/cdk.out/

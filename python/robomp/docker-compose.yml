@@ -81,14 +81,13 @@ services:
       - robomp_internal
     volumes:
       - robomp_data:/data
-      # Host agent config is mounted read-only under /srv/agent-home-stage
-      # with host-controlled permissions. The entrypoint copies it into
-      # root-owned, world-readable files under /srv/agent-home; the agent
-      # subprocess runs with HOME=/srv/agent-home, so ~/.omp and ~/.agent
-      # resolve there without exposing mutable host mounts.
-      - ${HOME}/.omp/agent/models.container.yml:/srv/agent-home-stage/.omp/agent/models.yml:ro
-      - ${HOME}/.agent/AGENT.md:/srv/agent-home-stage/.agent/AGENTS.md:ro
-      - ${HOME}/.agent/rules:/srv/agent-home-stage/.agent/rules:ro
+      # Layer 1 (skills, subagents, base config.yml/mcp.json, base rules) is
+      # baked into the image at /srv/agent-home-stage. This mount is layer 2:
+      # drop .omp/agent/models.yml and .agent/AGENTS.md into the directory, or
+      # point ROBOMP_AGENT_HOME_OVERRIDE at your own tree. The entrypoint copies
+      # both layers into root-owned, world-readable files under /srv/agent-home;
+      # the agent runs with HOME=/srv/agent-home.
+      - ${ROBOMP_AGENT_HOME_OVERRIDE:-./agent-home-local}:/srv/agent-home-override:ro
     ports:
       - "0.0.0.0:6543:8080"
 

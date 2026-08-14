@@ -94,6 +94,85 @@ aws ec2 reboot-instances --instance-ids "$(aws cloudformation describe-stacks   
 4. Secret: same as `GITHUB_WEBHOOK_SECRET`
 5. Events: Issues, Issue comments, Pull requests, Pull request reviews, Pull request review comments
 
+
+## Agent configuration (skills, subagents, MCP servers, omp settings)
+
+The agent runs with `HOME=/srv/agent-home`. omp reads `~/.omp/agent/**` and
+`~/.agent/**` from there. Two layers build that tree, in this order, later wins
+**per file**:
+
+| Layer | Source | Channel | Carries |
+|---|---|---|---|
+| 1 | `infra/cdk/robomp/assets/agent-bundle/` | Docker image (`/srv/agent-home-stage`) | skills, subagents, base `config.yml`, base `mcp.json`, `AGENTS.md`, base rules |
+| 2 | `/etc/robomp/agent-home/` on the instance | user-data + secret (`/srv/agent-home-override`, read-only mount) | `models.yml`, `00-aws-isolation.md`, optional `AGENTS.md` / `config.yml` / `mcp.json` |
+
+Both the container entrypoint and `worker._stage_agent_home()` copy layer 1 then
+layer 2 with `cp -a <src>/. <dst>/`, so an override file replaces only itself and
+never hides a sibling in the same directory.
+
+Every layer is a literal image of `$HOME`, so both trees use real dotfile
+directories and hold the same relative paths:
+
+```
+.omp/agent/config.yml                  omp settings (YAML)
+.omp/agent/mcp.json                    { "mcpServers": { "<name>": { … } } }
+.omp/agent/agents/<name>.md            subagent definition
+.omp/agent/skills/<name>/SKILL.md      skill
+.omp/agent/models.yml                  model/gateway routing (layer 2 only)
+.agent/AGENTS.md                       always-on instructions
+.agent/rules/<NN>-<name>.md            rule files, sorted by name
+```
+
+**Frontmatter is load-bearing.** A skill needs `name` and `description`; a
+`SKILL.md` with no `description` is dropped silently. A subagent needs `name` and
+`description`; `tools` is an optional CSV allowlist. Prefixes keep rules ordered:
+`00-` is reserved for the CDK-supplied AWS isolation rule, so bundle rules start
+at `10-`.
+
+MCP server entry shape — per-server keys are `command`, `args`, `env`, `cwd`,
+`url`, `headers`, `type` (`stdio` | `sse` | `http`), `enabled`, `timeout`,
+`requestIdFormat`, `auth`, `oauth`. Values expand `${VAR}` from the omp process
+environment:
+
+```json
+{
+  "mcpServers": {
+    "local-tool": {
+      "type": "stdio",
+      "command": "my-mcp-server",
+      "args": ["--stdio"],
+      "env": { "XDG_CACHE_HOME": "${XDG_CACHE_HOME}" }
+    },
+    "remote-tool": {
+      "type": "http",
+      "url": "https://mcp.example.internal/v1",
+      "headers": { "Authorization": "Bearer ${MY_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+A stdio server must not write to `$HOME`: the agent runs as `omp-<n>` with a
+root-owned, read-only `HOME`. Point it at the per-slot writable cache via
+`XDG_CACHE_HOME` as shown.
+
+### Operator loop
+
+The two halves of `assets/` deploy through different channels:
+
+- Change under `assets/agent-bundle/` → rebuild and push the image, then deploy
+  with the new `-c robompImage=` tag. `npx cdk synth` alone changes nothing.
+- Change under `assets/` (rules, models.container.yml) → `npx cdk deploy`;
+  the instance is replaced and cloud-init re-renders `/etc/robomp/agent-home`.
+- Optional secret keys `OMP_CONFIG_YML` and `OMP_MCP_JSON` hold whole-file text.
+  A written file **replaces** the baked file of the same name; it is not merged.
+  Store them as JSON strings with `\n` escapes, not nested objects. Bump
+  `-c provisionNonce=<n>` to force a re-read of the secret.
+
+User-data is capped at 16 KB and the synth fails with an explicit message if the
+rendered script exceeds it. Multi-file assets (skills, subagents) must go in the
+image bundle, never in user-data.
+
 ## Layout
 
 ```
@@ -101,6 +180,7 @@ infra/cdk/robomp/
   bin/app.ts
   lib/robomp-stack.ts
   assets/                 # baked into instance user-data at synth time
+  assets/agent-bundle/    # baked into the robomp image, NOT user-data
 python/robomp/
   docker-compose.yml      # base (gh-proxy isolation unchanged)
   docker-compose.aws.yml  # GHCR image + LiteLLM

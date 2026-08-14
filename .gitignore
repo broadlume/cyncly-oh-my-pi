@@ -11,5 +11,7 @@ python/robomp/data/
 python/robomp/.cache/
 python/robomp/src/static/
 python/robomp/web/dist/
+python/robomp/agent-home-local/*
+!python/robomp/agent-home-local/.gitkeep
 *.egg-info/
 target/

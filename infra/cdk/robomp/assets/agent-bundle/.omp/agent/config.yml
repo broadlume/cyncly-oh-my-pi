@@ -1,0 +1,5 @@
+# Base omp settings for the robomp agent. The host override layer
+# (/srv/agent-home-override/.omp/agent/config.yml) replaces this file
+# wholesale when present; omp does not merge two config.yml files.
+autolearn:
+  enabled: false

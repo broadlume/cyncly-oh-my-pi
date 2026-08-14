@@ -123,6 +123,8 @@ ANTHROPIC_API_KEY=$(json_get ANTHROPIC_API_KEY || true)
 OPENAI_API_KEY=$(json_get OPENAI_API_KEY || true)
 AZURE_API_KEY=$(json_get AZURE_API_KEY || true)
 GROQ_API_KEY=$(json_get GROQ_API_KEY || true)
+OMP_CONFIG_YML=$(json_get OMP_CONFIG_YML || true)
+OMP_MCP_JSON=$(json_get OMP_MCP_JSON || true)
 
 : "${ROBOMP_GIT_AUTHOR_NAME:=robomp}"
 : "${ROBOMP_MODEL:=anthropic/claude-sonnet-4-6}"
@@ -158,11 +160,27 @@ chmod 0600 /etc/robomp/.env
 # Compose files + static assets are written by the CDK user-data preamble
 # into $COMPOSE_DIR and $CONFIG_DIR before this script runs.
 
-if [ -f "$CONFIG_DIR/models.container.yml.tmpl" ]; then
+AGENT_HOME_DIR=$CONFIG_DIR/agent-home
+if [ -f "$AGENT_HOME_DIR/.omp/agent/models.yml.tmpl" ]; then
   sed "s|__LITELLM_MASTER_KEY__|${LITELLM_MASTER_KEY}|g" \
-    "$CONFIG_DIR/models.container.yml.tmpl" > "$CONFIG_DIR/models.container.yml"
-  chmod 0644 "$CONFIG_DIR/models.container.yml"
+    "$AGENT_HOME_DIR/.omp/agent/models.yml.tmpl" > "$AGENT_HOME_DIR/.omp/agent/models.yml"
+  rm -f "$AGENT_HOME_DIR/.omp/agent/models.yml.tmpl"
+  chmod 0644 "$AGENT_HOME_DIR/.omp/agent/models.yml"
 fi
+
+# Optional whole-file overrides from the deployment secret. Absent or empty
+# keys leave the image-baked defaults in place; a written file replaces the
+# baked file of the same name. Multi-file assets (skills/, agents/) ship in
+# the image, not the secret.
+for pair in "OMP_CONFIG_YML:.omp/agent/config.yml" "OMP_MCP_JSON:.omp/agent/mcp.json"; do
+  key=${pair%%:*}
+  rel=${pair#*:}
+  eval "value=\${$key:-}"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value" > "$AGENT_HOME_DIR/$rel"
+    chmod 0644 "$AGENT_HOME_DIR/$rel"
+  fi
+done
 
 # Ensure external volume exists as bind to EBS.
 if ! docker volume inspect robomp_robomp_data >/dev/null 2>&1; then

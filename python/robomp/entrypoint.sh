@@ -53,12 +53,15 @@ chmod 0700 /data/logs
 
 rm -rf /srv/agent-home/.agent /srv/agent-home/.omp/agent
 mkdir -p /srv/agent-home/.agent /srv/agent-home/.omp/agent
-if [ -e /srv/agent-home-stage/.agent ]; then
-    cp -a /srv/agent-home-stage/.agent/. /srv/agent-home/.agent/
-fi
-if [ -e /srv/agent-home-stage/.omp/agent ]; then
-    cp -a /srv/agent-home-stage/.omp/agent/. /srv/agent-home/.omp/agent/
-fi
+# Layer 1: image bundle. Layer 2: host override mount. Later wins per file.
+for layer in /srv/agent-home-stage /srv/agent-home-override; do
+    if [ -e "$layer/.agent" ]; then
+        cp -a "$layer/.agent/." /srv/agent-home/.agent/
+    fi
+    if [ -e "$layer/.omp/agent" ]; then
+        cp -a "$layer/.omp/agent/." /srv/agent-home/.omp/agent/
+    fi
+done
 chown -R root:root /srv/agent-home || true
 find /srv/agent-home -type d -exec chmod 0755 {} +
 find /srv/agent-home -type f -exec chmod 0644 {} +

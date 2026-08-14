@@ -436,7 +436,6 @@ export class RobompStack extends cdk.Stack {
     const composeAws = fs.readFileSync(path.join(robompSrcDir, "docker-compose.aws.yml"), "utf8");
     const modelsTmpl = fs.readFileSync(path.join(assetsDir, "models.container.yml"), "utf8");
     const litellmCfg = fs.readFileSync(path.join(assetsDir, "litellm.config.yaml"), "utf8");
-    const agentMd = fs.readFileSync(path.join(assetsDir, "AGENT.md"), "utf8");
     const rulesMd = fs.readFileSync(path.join(assetsDir, "rules", "00-aws-isolation.md"), "utf8");
     let bootstrap = fs.readFileSync(path.join(assetsDir, "user-data.sh"), "utf8");
     bootstrap = bootstrap
@@ -454,7 +453,10 @@ export class RobompStack extends cdk.Stack {
       );
     };
 
-    userData.addCommands("set -euo pipefail", "mkdir -p /opt/robomp /etc/robomp/rules");
+    userData.addCommands(
+      "set -euo pipefail",
+      "mkdir -p /opt/robomp /etc/robomp/agent-home/.agent/rules /etc/robomp/agent-home/.omp/agent",
+    );
     // Secret values are read once at first boot. Bump `-c provisionNonce=<n>`
     // to change the user-data hash and force an instance replacement (and thus
     // a re-read of the secret) without any other change.
@@ -463,11 +465,22 @@ export class RobompStack extends cdk.Stack {
       userData.addCommands(`# provision-nonce: ${provisionNonce}`);
     }
     writeFile("/opt/robomp/docker-compose.aws.yml", composeAws);
-    writeFile("/etc/robomp/models.container.yml.tmpl", modelsTmpl);
+    writeFile("/etc/robomp/agent-home/.omp/agent/models.yml.tmpl", modelsTmpl);
     writeFile("/etc/robomp/litellm.config.yaml", litellmCfg);
-    writeFile("/etc/robomp/AGENT.md", agentMd);
-    writeFile("/etc/robomp/rules/00-aws-isolation.md", rulesMd);
+    // .agent/AGENTS.md ships in the image bundle (layer 1), not user-data.
+    writeFile("/etc/robomp/agent-home/.agent/rules/00-aws-isolation.md", rulesMd);
     userData.addCommands(bootstrap);
+
+    // EC2 caps raw user-data at 16 KB; breaching it fails at deploy time with an
+    // opaque CloudFormation error. Fail at synth instead.
+    const userDataBytes = Buffer.byteLength(userData.render(), "utf8");
+    const USER_DATA_LIMIT = 16 * 1024;
+    if (userDataBytes > USER_DATA_LIMIT) {
+      throw new Error(
+        `robomp user-data is ${userDataBytes} bytes, over the EC2 ${USER_DATA_LIMIT}-byte limit. ` +
+          `Move content into the image bundle at infra/cdk/robomp/assets/agent-bundle/ instead of inlining it from infra/cdk/robomp/assets/.`,
+      );
+    }
 
     const instance = new ec2.Instance(this, "Instance", {
       vpc,
