@@ -52,7 +52,6 @@ export class RobompStack extends cdk.Stack {
     const vpcCidr = props.vpcCidr ?? "10.77.0.0/16";
     const dataVolumeGiB = props.dataVolumeGiB ?? 100;
     const assetsDir = path.join(__dirname, "..", "assets");
-    const robompSrcDir = path.join(__dirname, "..", "..", "..", "..", "python", "robomp");
 
     // ── KMS + secret ────────────────────────────────────────────────────────
     const key = new kms.Key(this, "Key", {
@@ -433,7 +432,6 @@ export class RobompStack extends cdk.Stack {
     });
 
     const userData = ec2.UserData.forLinux();
-    const composeAws = fs.readFileSync(path.join(robompSrcDir, "docker-compose.aws.yml"), "utf8");
     const modelsTmpl = fs.readFileSync(path.join(assetsDir, "models.container.yml"), "utf8");
     const litellmCfg = fs.readFileSync(path.join(assetsDir, "litellm.config.yaml"), "utf8");
     const rulesMd = fs.readFileSync(path.join(assetsDir, "rules", "00-aws-isolation.md"), "utf8");
@@ -464,7 +462,8 @@ export class RobompStack extends cdk.Stack {
     if (provisionNonce) {
       userData.addCommands(`# provision-nonce: ${provisionNonce}`);
     }
-    writeFile("/opt/robomp/docker-compose.aws.yml", composeAws);
+    // docker-compose.aws.yml and .agent/AGENTS.md ship in the robomp image; the
+    // bootstrap extracts the compose file with `docker cp` after GHCR login.
     writeFile("/etc/robomp/agent-home/.omp/agent/models.yml.tmpl", modelsTmpl);
     writeFile("/etc/robomp/litellm.config.yaml", litellmCfg);
     // .agent/AGENTS.md ships in the image bundle (layer 1), not user-data.
@@ -473,11 +472,20 @@ export class RobompStack extends cdk.Stack {
 
     // EC2 caps raw user-data at 16 KB; breaching it fails at deploy time with an
     // opaque CloudFormation error. Fail at synth instead.
+    //
+    // `render()` still holds unresolved CFN tokens (secret ARN, region, image
+    // ref) that grow when CloudFormation substitutes them: the 2026-08-14
+    // deploy rendered 16101 bytes at synth and landed 16207 bytes on the
+    // instance. BUDGET keeps a margin for that growth, so the guard trips
+    // before the deploy does.
     const userDataBytes = Buffer.byteLength(userData.render(), "utf8");
     const USER_DATA_LIMIT = 16 * 1024;
-    if (userDataBytes > USER_DATA_LIMIT) {
+    const TOKEN_GROWTH_MARGIN = 512;
+    const USER_DATA_BUDGET = USER_DATA_LIMIT - TOKEN_GROWTH_MARGIN;
+    if (userDataBytes > USER_DATA_BUDGET) {
       throw new Error(
-        `robomp user-data is ${userDataBytes} bytes, over the EC2 ${USER_DATA_LIMIT}-byte limit. ` +
+        `robomp user-data is ${userDataBytes} bytes, over the ${USER_DATA_BUDGET}-byte budget ` +
+          `(EC2 limit ${USER_DATA_LIMIT} minus a ${TOKEN_GROWTH_MARGIN}-byte margin for CFN token resolution). ` +
           `Move content into the image bundle at infra/cdk/robomp/assets/agent-bundle/ instead of inlining it from infra/cdk/robomp/assets/.`,
       );
     }

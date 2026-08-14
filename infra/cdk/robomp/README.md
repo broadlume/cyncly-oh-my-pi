@@ -169,9 +169,13 @@ The two halves of `assets/` deploy through different channels:
   Store them as JSON strings with `\n` escapes, not nested objects. Bump
   `-c provisionNonce=<n>` to force a re-read of the secret.
 
-User-data is capped at 16 KB and the synth fails with an explicit message if the
-rendered script exceeds it. Multi-file assets (skills, subagents) must go in the
-image bundle, never in user-data.
+EC2 caps user-data at 16 KB. The synth budget is 15,872 bytes — the limit minus a
+512-byte margin, because `UserData.render()` still holds CFN tokens (secret ARN,
+region, image ref) that grow when CloudFormation resolves them. Synth fails with
+an explicit message when the budget is exceeded. Multi-file assets (skills,
+subagents) must go in the image bundle, never in user-data. `docker-compose.aws.yml`
+travels in the image too; the bootstrap extracts it with `docker cp` after the GHCR
+login, which keeps the compose file and the image it launches in lockstep.
 
 ## Layout
 
@@ -183,5 +187,5 @@ infra/cdk/robomp/
   assets/agent-bundle/    # baked into the robomp image, NOT user-data
 python/robomp/
   docker-compose.yml      # base (gh-proxy isolation unchanged)
-  docker-compose.aws.yml  # GHCR image + LiteLLM
+  docker-compose.aws.yml  # GHCR image + LiteLLM; baked into the image, docker cp'd at boot
 ```

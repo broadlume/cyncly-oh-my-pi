@@ -194,6 +194,20 @@ fi
 
 echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
 
+# The compose file ships in the robomp image, not in user-data: EC2 caps
+# user-data at 16 KB, and this keeps the compose file and the image that it
+# launches from ever disagreeing. Extraction needs the GHCR login above.
+docker pull "$ROBOMP_IMAGE"
+docker rm -f robomp-cfg >/dev/null 2>&1 || true
+docker create --name robomp-cfg "$ROBOMP_IMAGE" true >/dev/null
+if ! docker cp robomp-cfg:/opt/robomp/docker-compose.aws.yml "$COMPOSE_DIR/docker-compose.aws.yml"; then
+  docker rm -f robomp-cfg >/dev/null 2>&1 || true
+  echo "FATAL: $ROBOMP_IMAGE has no /opt/robomp/docker-compose.aws.yml." >&2
+  echo "Deploy an image built after the compose file moved into the image." >&2
+  exit 1
+fi
+docker rm -f robomp-cfg >/dev/null
+
 cd "$COMPOSE_DIR"
 export COMPOSE_PROJECT_NAME=robomp
 docker compose \

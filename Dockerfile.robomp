@@ -121,6 +121,9 @@ RUN mkdir -p /srv/agent-home/.agent /srv/agent-home/.omp/agent \
 # The host override mount at /srv/agent-home-override is layer 2; the entrypoint
 # and the worker copy layer 1 then layer 2 into /srv/agent-home.
 COPY infra/cdk/robomp/assets/agent-bundle/ /srv/agent-home-stage/
+# The AWS compose file travels in the image; user-data extracts it at boot
+# (docker cp) instead of inlining 4.8 KB into the 16 KB user-data budget.
+COPY python/robomp/docker-compose.aws.yml /opt/robomp/docker-compose.aws.yml
 RUN mkdir -p /srv/agent-home-override
 
 COPY python/robomp/entrypoint.sh /usr/local/bin/robomp-entrypoint
