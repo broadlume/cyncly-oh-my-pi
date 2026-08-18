@@ -354,6 +354,41 @@ export class RobompStack extends cdk.Stack {
       });
     }
 
+    // Managed WAF rules and GitHub webhook payloads don't mix: issue/PR
+    // bodies routinely exceed the 8KB body-size cap and trip the XSS/RFI/RCE
+    // body matchers (code snippets, HTML, URLs), each yielding a bare ALB 403
+    // that silently drops the event. The endpoint is HMAC-authenticated
+    // (X-Hub-Signature-256, verified by the app), so WAF body inspection adds
+    // nothing there. Scope both managed groups down to everything EXCEPT a
+    // signed POST to /webhook/github; a forged header only reaches the app's
+    // constant-time signature check. RateLimit still covers all requests.
+    const notSignedWebhook: wafv2.CfnWebACL.StatementProperty = {
+      notStatement: {
+        statement: {
+          andStatement: {
+            statements: [
+              {
+                byteMatchStatement: {
+                  fieldToMatch: { uriPath: {} },
+                  positionalConstraint: "EXACTLY",
+                  searchString: "/webhook/github",
+                  textTransformations: [{ priority: 0, type: "NONE" }],
+                },
+              },
+              {
+                byteMatchStatement: {
+                  fieldToMatch: { singleHeader: { Name: "x-hub-signature-256" } },
+                  positionalConstraint: "STARTS_WITH",
+                  searchString: "sha256=",
+                  textTransformations: [{ priority: 0, type: "NONE" }],
+                },
+              },
+            ],
+          },
+        },
+      },
+    };
+
     const webAcl = new wafv2.CfnWebACL(this, "WebAcl", {
       defaultAction: { allow: {} },
       scope: "REGIONAL",
@@ -372,13 +407,7 @@ export class RobompStack extends cdk.Stack {
             managedRuleGroupStatement: {
               vendorName: "AWS",
               name: "AWSManagedRulesCommonRuleSet",
-              // GitHub webhook payloads (issue/PR bodies) routinely exceed the
-              // 8KB body-size cap and got blocked with a bare ALB 403. The
-              // endpoint is HMAC-authenticated (X-Hub-Signature-256), so the
-              // size cap adds nothing here; count instead of block.
-              ruleActionOverrides: [
-                { name: "SizeRestrictions_BODY", actionToUse: { count: {} } },
-              ],
+              scopeDownStatement: notSignedWebhook,
             },
           },
           visibilityConfig: {
@@ -395,6 +424,7 @@ export class RobompStack extends cdk.Stack {
             managedRuleGroupStatement: {
               vendorName: "AWS",
               name: "AWSManagedRulesKnownBadInputsRuleSet",
+              scopeDownStatement: notSignedWebhook,
             },
           },
           visibilityConfig: {
