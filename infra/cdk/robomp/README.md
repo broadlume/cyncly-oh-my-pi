@@ -97,7 +97,7 @@ aws ec2 reboot-instances --instance-ids "$(aws cloudformation describe-stacks   
 
 ## Agent configuration (skills, subagents, MCP servers, omp settings)
 
-The agent runs with `HOME=/srv/agent-home`. omp reads `~/.omp/agent/**` and
+The agent runs with `HOME=/data/agent-home`. omp reads `~/.omp/agent/**` and
 `~/.agent/**` from there. Two layers build that tree, in this order, later wins
 **per file**:
 

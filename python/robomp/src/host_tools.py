@@ -53,7 +53,7 @@ _REPO_COMMAND_SCRUBBED_ENV_KEYS: tuple[str, ...] = (
     "ROBOMP_GH_PROXY_HMAC_KEY",
 )
 _NEEDS_INFO_LABEL = "needs-info"
-_AGENT_HOME = Path("/srv/agent-home")
+_AGENT_HOME = Path("/data/agent-home")
 _PRE_PR_FIX_TIMEOUT_SECONDS = 600.0
 _PRE_PR_CHECK_TIMEOUT_SECONDS = 600.0
 _PRE_PR_CHECK_MAX_OUTPUT = 12_000

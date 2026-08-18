@@ -28,7 +28,7 @@ There are four ownership zones on disk; do not let them blur:
 3. **Language tool caches** (`/data/cache/{cargo,cargo-target,rustup,bun-cache}`):
    multi-slot. Owned by `root:omp` with setgid `02770`; provisioned by
    `entrypoint.sh`.
-4. **Agent HOME template** (`/srv/agent-home`): read-only, `root:root`
+4. **Agent HOME template** (`/data/agent-home`): read-only, `root:root`
    `0755/0644`.
 
 Bun's install cache stays workspace-private (zone 1) on purpose — bun
@@ -746,6 +746,11 @@ def _purge_trash(staged: Iterable[Path]) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def pool_dir_for(root: Path, repo_full_name: str) -> Path:
+    """Shared pool clone path for `repo_full_name` under workspace `root`."""
+    return root / "_pool" / repo_full_name.replace("/", "__")
+
+
 # ---------- SandboxManager ----------
 
 
@@ -782,7 +787,7 @@ class SandboxManager:
 
     # ---- pool ----
     def pool_path(self, repo: str) -> Path:
-        return self.pool / repo.replace("/", "__")
+        return pool_dir_for(self.root, repo)
 
     def ensure_clone(self, *, repo: str, clone_url: str, default_branch: str) -> Path:
         """Idempotent shared clone for `repo`.

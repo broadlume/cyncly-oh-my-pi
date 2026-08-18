@@ -116,7 +116,7 @@ _BAD_OBJECT_REF_RE = re.compile(
 _FETCH_PRUNE_REPAIR_ATTEMPTS = 8
 
 _SHARED_OMP_GID = 2000
-_AGENT_HOME = Path("/srv/agent-home")
+_AGENT_HOME = Path("/data/agent-home")
 
 
 def _slot_permissions_active(slot_uid: int | None) -> bool:

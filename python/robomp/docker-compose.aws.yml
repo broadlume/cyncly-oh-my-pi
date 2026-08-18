@@ -42,6 +42,10 @@ services:
       ROBOMP_LOG_DIR: /data/logs
       ROBOMP_BIND_HOST: ${ROBOMP_BIND_HOST:-0.0.0.0}
       ROBOMP_BIND_PORT: ${ROBOMP_BIND_PORT:-8080}
+      # Agent containers: per-task omp runs in its own container from this
+      # base image (or a per-repo image built from .robomp/Dockerfile.robomp).
+      ROBOMP_AGENT_BASE_IMAGE: ${ROBOMP_IMAGE}
+      ROBOMP_CONFIG_BRANCH: ${ROBOMP_CONFIG_BRANCH:-}
     depends_on:
       gh-proxy:
         condition: service_started
@@ -52,6 +56,9 @@ services:
       - robomp_internal
     volumes:
       - robomp_data:/data
+      # Host docker socket: the orchestrator builds and runs per-task agent
+      # containers as siblings on the host daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
       # Layer 2 override tree written by user-data. Layer 1 (skills, subagents,
       # base config.yml/mcp.json, base rules) is baked into the image.
       - /etc/robomp/agent-home:/srv/agent-home-override:ro

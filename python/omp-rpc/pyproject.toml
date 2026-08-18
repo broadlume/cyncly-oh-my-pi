@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omp-rpc"
-version = "0.1.0"
+version = "0.1.1"
 description = "Typed Python client for the omp coding-agent RPC protocol"
 readme = "README.md"
 requires-python = ">=3.11"

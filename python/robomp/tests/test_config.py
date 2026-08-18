@@ -179,3 +179,31 @@ def test_task_timeout_hard_grace_env_parses(monkeypatch: pytest.MonkeyPatch, env
     reset_settings_cache()
     cfg = Settings()  # type: ignore[call-arg]
     assert cfg.task_timeout_hard_grace_seconds == 12.5
+
+
+def test_config_branch_for_mapped_repo(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    monkeypatch.setenv("ROBOMP_CONFIG_BRANCH", "octo/widget=development, acme/api=main")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.config_branch_for("octo/widget") == "development"
+    assert cfg.config_branch_for("acme/api") == "main"
+
+
+def test_config_branch_for_is_case_insensitive(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    monkeypatch.setenv("ROBOMP_CONFIG_BRANCH", "Octo/Widget=development")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.config_branch_for("octo/widget") == "development"
+
+
+def test_config_branch_for_unmapped_returns_none(env: dict[str, str]) -> None:
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.config_branch_for("octo/widget") is None
+
+
+def test_config_branch_for_skips_malformed_entries(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
+    monkeypatch.setenv("ROBOMP_CONFIG_BRANCH", "garbage, ,octo/widget=dev,broken")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    assert cfg.config_branch_for("octo/widget") == "dev"
+    assert cfg.config_branch_for("broken") is None

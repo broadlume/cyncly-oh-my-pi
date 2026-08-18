@@ -68,10 +68,17 @@ services:
       ROBOMP_LOG_DIR: /data/logs
       ROBOMP_BIND_HOST: ${ROBOMP_BIND_HOST:-0.0.0.0}
       ROBOMP_BIND_PORT: ${ROBOMP_BIND_PORT:-8080}
+
+      # --- agent containers ---
+      # Per-task omp runs in its own container from this base image (or a
+      # per-repo image built from .robomp/Dockerfile.robomp on the repo's
+      # config branch). Requires the docker socket mount below.
+      ROBOMP_AGENT_BASE_IMAGE: robomp:dev
+      ROBOMP_CONFIG_BRANCH: ${ROBOMP_CONFIG_BRANCH:-}
     depends_on:
       gh-proxy:
         condition: service_started
-    # Resolve `llm-gateway.internal` (used in /srv/agent-home/.omp/agent/models.yml) to the
+    # Resolve `llm-gateway.internal` (used in /data/agent-home/.omp/agent/models.yml) to the
     # Docker host. The actual gateway listens on 127.0.0.1:4000 on the host;
     # `host-gateway` is Docker's alias for the host bridge IP.
     extra_hosts:
@@ -85,9 +92,12 @@ services:
       # baked into the image at /srv/agent-home-stage. This mount is layer 2:
       # drop .omp/agent/models.yml and .agent/AGENTS.md into the directory, or
       # point ROBOMP_AGENT_HOME_OVERRIDE at your own tree. The entrypoint copies
-      # both layers into root-owned, world-readable files under /srv/agent-home;
-      # the agent runs with HOME=/srv/agent-home.
+      # both layers into root-owned, world-readable files under /data/agent-home;
+      # the agent runs with HOME=/data/agent-home.
       - ${ROBOMP_AGENT_HOME_OVERRIDE:-./agent-home-local}:/srv/agent-home-override:ro
+      # Host docker socket: the orchestrator builds and runs per-task agent
+      # containers as siblings on the host daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "0.0.0.0:6543:8080"
 

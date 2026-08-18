@@ -956,6 +956,18 @@ class RpcClientTests(unittest.TestCase):
             ),
         )
 
+    def test_command_prefix_prepends_to_built_command(self) -> None:
+        client = RpcClient(command_prefix=("docker", "run"), executable="omp")
+        self.assertEqual(client.command[:4], ("docker", "run", "omp", "--mode"))
+
+    def test_explicit_command_ignores_prefix(self) -> None:
+        client = RpcClient(command=("custom", "--flag"), command_prefix=("docker", "run"))
+        self.assertEqual(client.command, ("custom", "--flag"))
+
+    def test_empty_prefix_leaves_command_unchanged(self) -> None:
+        client = RpcClient(executable="omp", no_session=True)
+        self.assertEqual(client.command[:3], ("omp", "--mode", "rpc"))
+
     def test_get_state_and_bash(self) -> None:
         with self.make_client() as client:
             state = client.get_state()

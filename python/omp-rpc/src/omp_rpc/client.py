@@ -444,6 +444,7 @@ class RpcClient:
         *,
         command: Sequence[str] | None = None,
         executable: str = "omp",
+        command_prefix: Sequence[str] = (),
         provider: str | None = None,
         model: str | None = None,
         session_dir: str | Path | None = None,
@@ -471,6 +472,7 @@ class RpcClient:
     ) -> None:
         self._command = tuple(command) if command is not None else None
         self._executable = executable
+        self._command_prefix = tuple(command_prefix)
         self._provider = provider
         self._model = model
         self._session_dir = Path(session_dir) if session_dir is not None else None
@@ -1795,7 +1797,7 @@ class RpcClient:
         if self._command is not None:
             return self._command
 
-        command: list[str] = [self._executable, "--mode", "rpc"]
+        command: list[str] = [*self._command_prefix, self._executable, "--mode", "rpc"]
         if self._provider:
             command.extend(["--provider", self._provider])
         if self._model:

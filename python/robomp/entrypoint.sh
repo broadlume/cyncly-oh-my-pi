@@ -43,7 +43,7 @@ mkdir -p /data/workspaces /data/workspaces/_pool /data/logs
 # so every per-issue worktree shares one cargo target/toolchain. Bun install
 # cache is workspace-private; a shared cache is unsafe across slot users
 # because bun may chmod/chown its cache root to the first writer.
-mkdir -p /data/cache/cargo /data/cache/cargo-target /data/cache/rustup /data/cache/pi-natives
+mkdir -p /data/cache/cargo /data/cache/cargo-target /data/cache/rustup /data/cache/pi-natives /data/cache/corepack
 chown -R root:omp /data/cache /data/workspaces/_pool
 find /data/cache /data/workspaces/_pool -type d -exec chmod 2770 {} +
 find /data/cache /data/workspaces/_pool -type f -perm /111 -exec chmod 0770 {} +
@@ -51,31 +51,32 @@ find /data/cache /data/workspaces/_pool -type f ! -perm /111 -exec chmod 0660 {}
 chmod 0700 /data/logs
 
 
-rm -rf /srv/agent-home/.agent /srv/agent-home/.omp/agent
-mkdir -p /srv/agent-home/.agent /srv/agent-home/.omp/agent
+rm -rf /data/agent-home/.agent /data/agent-home/.omp/agent
+mkdir -p /data/agent-home/.agent /data/agent-home/.omp/agent
+printf '[install]\nbackend = "copyfile"\n' > /data/agent-home/.bunfig.toml
 # Layer 1: image bundle. Layer 2: host override mount. Later wins per file.
 for layer in /srv/agent-home-stage /srv/agent-home-override; do
     if [ -e "$layer/.agent" ]; then
-        cp -a "$layer/.agent/." /srv/agent-home/.agent/
+        cp -a "$layer/.agent/." /data/agent-home/.agent/
     fi
     if [ -e "$layer/.omp/agent" ]; then
-        cp -a "$layer/.omp/agent/." /srv/agent-home/.omp/agent/
+        cp -a "$layer/.omp/agent/." /data/agent-home/.omp/agent/
     fi
 done
-chown -R root:root /srv/agent-home || true
-find /srv/agent-home -type d -exec chmod 0755 {} +
-find /srv/agent-home -type f -exec chmod 0644 {} +
+chown -R root:root /data/agent-home || true
+find /data/agent-home -type d -exec chmod 0755 {} +
+find /data/agent-home -type f -exec chmod 0644 {} +
 
 # omp registers daemon project presence under ~/.omp/run at startup, nesting
 # per-project dirs (daemons/<hash>/clients) that any slot user must be able to
 # create and enter regardless of which slot first made them: setgid + group
 # omp keeps the whole tree group-writable (entrypoint umask 0002 carries into
 # slot processes, so new entries stay group-writable too).
-mkdir -p /srv/agent-home/.omp/run
-chgrp -R omp /srv/agent-home/.omp/run
-chmod -R g+rwX /srv/agent-home/.omp/run
-find /srv/agent-home/.omp/run -type d -exec chmod g+s {} +
-chmod 2770 /srv/agent-home/.omp/run
+mkdir -p /data/agent-home/.omp/run
+chgrp -R omp /data/agent-home/.omp/run
+chmod -R g+rwX /data/agent-home/.omp/run
+find /data/agent-home/.omp/run -type d -exec chmod g+s {} +
+chmod 2770 /data/agent-home/.omp/run
 
 touch /data/robomp.sqlite
 chown root:root /data/robomp.sqlite

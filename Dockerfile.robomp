@@ -16,6 +16,7 @@
 
 ARG BUN_VERSION=1.3.14
 ARG OMP_VERSION=v17.3.1
+ARG NODE_VERSION=22.23.2
 
 ############################
 # 1) web-builder — Bun + Vite, builds the SolidJS dashboard bundle.
@@ -43,6 +44,7 @@ FROM python:3.12-slim-bookworm AS runtime
 
 ARG BUN_VERSION
 ARG OMP_VERSION
+ARG NODE_VERSION
 ARG TARGETARCH
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -53,15 +55,50 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CARGO_HOME=/data/cache/cargo \
     CARGO_TARGET_DIR=/data/cache/cargo-target \
     RUSTUP_HOME=/data/cache/rustup \
+    COREPACK_HOME=/data/cache/corepack \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
     PATH=/opt/bun/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl ca-certificates unzip openssh-client tini sqlite3 \
         build-essential pkg-config libssl-dev \
+        xz-utils chromium fonts-liberation gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
     && /opt/bun/bin/bun --version
+
+# Node 22 (verified tarball) + corepack shims for pnpm/yarn. Repos pin their
+# package manager via `packageManager`; corepack resolves the version lazily
+# into COREPACK_HOME on the /data volume.
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+      amd64) node_arch=x64 ;; \
+      arm64) node_arch=arm64 ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    base="https://nodejs.org/dist/v${NODE_VERSION}"; \
+    curl -fsSL -o /tmp/node.tar.xz "${base}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+    curl -fsSL -o /tmp/SHASUMS256.txt "${base}/SHASUMS256.txt"; \
+    expected="$(awk -v a="node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" '$2 == a { print $1 }' /tmp/SHASUMS256.txt)"; \
+    test -n "${expected}"; \
+    echo "${expected}  /tmp/node.tar.xz" | sha256sum -c -; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner; \
+    rm -f /tmp/node.tar.xz /tmp/SHASUMS256.txt; \
+    node --version; \
+    corepack enable --install-directory /usr/local/bin pnpm yarn
+
+# Docker CLI only (client): the daemon is the host's, reached via the mounted
+# /var/run/docker.sock. Used to build/run per-repo agent containers.
+RUN set -eux; \
+    install -d -m 0755 /etc/apt/keyrings; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc; \
+    echo "deb [arch=${TARGETARCH} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
+        > /etc/apt/sources.list.d/docker.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends docker-ce-cli; \
+    rm -rf /var/lib/apt/lists/*
 
 # Rustup launcher only — the real toolchain is fetched lazily into RUSTUP_HOME
 # on first cargo invocation. Keeps the image small while sharing the toolchain
@@ -111,15 +148,13 @@ RUN pip install --no-cache-dir \
 # Agent config arrives in two layers: the image bundle at /srv/agent-home-stage
 # and a read-only host mount at /srv/agent-home-override. The entrypoint copies
 # layer 1 then layer 2 into root-owned world-readable files under
-# /srv/agent-home; the agent subprocess runs with HOME=/srv/agent-home, so
-# ~/.omp and ~/.agent resolve there without exposing mutable host mounts.
-RUN mkdir -p /srv/agent-home/.agent /srv/agent-home/.omp/agent \
-    && mkdir -p /srv/agent-home-stage/.agent /srv/agent-home-stage/.omp/agent \
-    && printf '[install]\nbackend = "copyfile"\n' > /srv/agent-home/.bunfig.toml
+# /data/agent-home (on the shared volume, visible to agent containers); the
+# agent runs with HOME=/data/agent-home, so ~/.omp and ~/.agent resolve there.
+RUN mkdir -p /srv/agent-home-stage/.agent /srv/agent-home-stage/.omp/agent
 
 # Versioned agent-config bundle (layer 1); its tree is a literal image of $HOME.
 # The host override mount at /srv/agent-home-override is layer 2; the entrypoint
-# and the worker copy layer 1 then layer 2 into /srv/agent-home.
+# and the worker copy layer 1 then layer 2 into /data/agent-home.
 COPY infra/cdk/robomp/assets/agent-bundle/ /srv/agent-home-stage/
 # The AWS compose file travels in the image; user-data extracts it at boot
 # (docker cp) instead of inlining 4.8 KB into the 16 KB user-data budget.

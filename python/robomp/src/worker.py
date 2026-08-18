@@ -16,8 +16,12 @@ import asyncio
 import grp
 import logging
 import os
+import re
+import secrets
 import shutil
+import subprocess
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,7 +34,7 @@ from omp_rpc import (
     ToolExecutionEndEvent,
 )
 
-from robomp import host_tools, persona, pragmas
+from robomp import agent_image, host_tools, persona, pragmas
 from robomp.cancellation import register_cancel_hook, unregister_cancel_hook
 from robomp.config import Settings
 from robomp.db import Database, issue_key
@@ -40,7 +44,7 @@ from robomp.github_client import CommentInfo, IssueInfo, PullRequestInfo, RepoIn
 from robomp.host_tools import AbortController, ToolBindings, _git_identity_env
 from robomp.natives_cache import NativesCache
 from robomp.natives_cache import compute_key as natives_compute_key
-from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env, _safe_directory_env
+from robomp.sandbox import GitTransport, Workspace, _prepare_slot_runtime_env, _safe_directory_env, pool_dir_for
 
 log = logging.getLogger(__name__)
 
@@ -118,7 +122,7 @@ _SCRUBBED_ENV_KEYS: tuple[str, ...] = (
     "ROBOMP_GH_PROXY_HMAC_KEY",
 )
 
-_AGENT_HOME = Path("/srv/agent-home")
+_AGENT_HOME = Path("/data/agent-home")
 _AGENT_HOME_STAGE = Path("/srv/agent-home-stage")
 _AGENT_HOME_OVERRIDE = Path("/srv/agent-home-override")
 
@@ -504,6 +508,55 @@ def _build_prompt(
     raise ValueError(f"unknown task kind: {task_kind!r}")
 
 
+def _docker_run_prefix(
+    *,
+    settings: Settings,
+    workspace: Workspace,
+    slot_uid: int | None,
+    env: Mapping[str, str],
+    image: str,
+    container_name: str,
+) -> list[str]:
+    """`docker run` argv prefix that wraps the omp RPC command in a container.
+
+    The tmpfs shadows the shared ``/data/agent-home/.omp/run`` so each
+    container gets private omp daemon presence. ``--init`` gives the container
+    a reaping PID 1 for the agent's bash children. ``--entrypoint ""`` bypasses
+    the image's robomp-entrypoint: it is root-only orchestrator provisioning
+    and would abort under ``--user``; the RPC command is a complete argv. The
+    container gets env solely via ``-e``.
+    """
+    prefix = [
+        "docker", "run", "--rm", "-i", "--init",
+        "--name", container_name,
+        "--entrypoint", "",
+        "--network", settings.agent_docker_network,
+        "--volume", f"{settings.agent_docker_volume}:/data",
+        "--tmpfs", "/data/agent-home/.omp/run:rw,mode=1777",
+        "--workdir", str(workspace.repo_dir),
+    ]
+    if slot_uid is not None:
+        prefix.extend(["--user", f"{slot_uid}:{slot_uid}", "--group-add", "2000"])
+    for key, value in env.items():
+        prefix.extend(["-e", f"{key}={value}"])
+    prefix.append(image)
+    return prefix
+
+
+def _agent_container_name(workspace_key: str) -> str:
+    raw = f"robomp-agent-{workspace_key}-{secrets.token_hex(4)}".lower()
+    return re.sub(r"[^a-z0-9_.-]", "-", raw)[:63]
+
+
+def _force_remove_container(name: str) -> None:
+    """Best-effort `docker rm -f`; a SIGKILLed docker client orphans the container."""
+    try:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=5)
+    except Exception:  # noqa: BLE001 - teardown is strictly best-effort
+        pass
+
+
+
 def _run_rpc_blocking(
     inputs: TaskInputs,
     *,
@@ -593,6 +646,30 @@ def _run_rpc_blocking(
         )
     )
 
+    containerized = bool(settings.agent_base_image)
+    command_prefix: list[str] = []
+    container_name: str | None = None
+    if containerized:
+        image = agent_image.resolve_agent_image(
+            settings=settings,
+            repo=inputs.repo,
+            pool_dir=pool_dir_for(Path(settings.workspace_root), inputs.repo.full_name),
+            git_transport=inputs.git_transport,
+        )
+        container_name = _agent_container_name(bindings.workspace.workspace_key)
+        command_prefix = _docker_run_prefix(
+            settings=settings,
+            workspace=bindings.workspace,
+            slot_uid=inputs.slot_uid,
+            env=rpc_env,
+            image=image,
+            container_name=container_name,
+        )
+        log.info(
+            "agent_container",
+            extra={"issue": bindings.issue_key, "image": image, "container": container_name},
+        )
+
     with RpcClient(
         executable=settings.omp_command,
         cwd=bindings.workspace.repo_dir,
@@ -609,9 +686,10 @@ def _run_rpc_blocking(
         startup_timeout=60.0,
         max_event_history=50_000,
         extra_args=extra_args,
-        user=inputs.slot_uid,
-        group=inputs.slot_uid if inputs.slot_uid is not None else None,
-        extra_groups=["omp"] if inputs.slot_uid is not None else None,
+        user=inputs.slot_uid if not containerized else None,
+        group=inputs.slot_uid if inputs.slot_uid is not None and not containerized else None,
+        extra_groups=["omp"] if inputs.slot_uid is not None and not containerized else None,
+        command_prefix=command_prefix,
     ) as client:
         # Arm cancellation: from this point the API can kill the omp subprocess
         # out from under us, which makes `prompt_and_wait` raise an `RpcError`
@@ -634,6 +712,8 @@ def _run_rpc_blocking(
                 client._mark_closed(  # noqa: SLF001
                     RpcProcessExitError("cancelled by operator")
                 )
+                if container_name is not None:
+                    _force_remove_container(container_name)
 
         if bindings.abort is not None:
             bindings.abort.stop = _cancel_hook
@@ -738,6 +818,8 @@ def _run_rpc_blocking(
             return turn.assistant_text
         finally:
             unregister_cancel_hook()
+            if container_name is not None:
+                _force_remove_container(container_name)
 
 
 async def run_task(

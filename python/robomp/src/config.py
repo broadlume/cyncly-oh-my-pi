@@ -100,6 +100,35 @@ class Settings(BaseSettings):
     sqlite_path: Path = Field(Path("./data/robomp.sqlite"), alias="ROBOMP_SQLITE_PATH")
     log_dir: Path = Field(Path("./data/logs"), alias="ROBOMP_LOG_DIR")
 
+    # Agent containers. `agent_base_image` unset/empty means legacy in-process
+    # omp spawn (unit tests, bare-metal dev); compose sets it in deploys.
+    agent_base_image: str | None = Field(None, alias="ROBOMP_AGENT_BASE_IMAGE")
+    # Comma-separated `owner/repo=branch` pairs mapping repos to the branch
+    # their `.robomp/` config is read from. Unmapped repos use their GitHub
+    # default branch.
+    config_branch_map: str = Field("", alias="ROBOMP_CONFIG_BRANCH")
+    agent_docker_network: str = Field("robomp_default", alias="ROBOMP_AGENT_DOCKER_NETWORK")
+    agent_docker_volume: str = Field("robomp_robomp_data", alias="ROBOMP_AGENT_DOCKER_VOLUME")
+    agent_image_build_timeout_seconds: float = Field(1800.0, alias="ROBOMP_AGENT_IMAGE_BUILD_TIMEOUT_SECONDS")
+
+    def config_branch_for(self, repo_full_name: str) -> str | None:
+        """Branch holding `.robomp/` config for `repo_full_name`.
+
+        Parses `config_branch_map` as comma-separated `owner/repo=branch`
+        pairs (whitespace-tolerant, repo match case-insensitive). Malformed
+        pairs are skipped. Returns None when unmapped, meaning "use the
+        repo's GitHub default branch".
+        """
+        wanted = repo_full_name.strip().lower()
+        for pair in self.config_branch_map.split(","):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            repo, _, branch = pair.partition("=")
+            if repo.strip().lower() == wanted and branch.strip():
+                return branch.strip()
+        return None
+
     # Server
     bind_host: str = Field("0.0.0.0", alias="ROBOMP_BIND_HOST")
     bind_port: int = Field(8080, alias="ROBOMP_BIND_PORT")

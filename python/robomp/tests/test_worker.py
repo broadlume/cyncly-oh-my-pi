@@ -1069,3 +1069,58 @@ def test_capture_natives_cache_records_on_success(
     assert repo == "acme/widgets"
     assert key == "cafef00d"
     assert native_dir == inputs.workspace.repo_dir / "packages" / "natives" / "native"
+
+
+def _prefix_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        agent_docker_network="robomp_default",
+        agent_docker_volume="robomp_robomp_data",
+    )
+
+
+def test_docker_run_prefix_full_flag_set() -> None:
+    workspace = SimpleNamespace(repo_dir=Path("/data/workspaces/octo/repo"))
+    prefix = worker._docker_run_prefix(
+        settings=_prefix_settings(),
+        workspace=workspace,
+        slot_uid=2001,
+        env={"HOME": "/data/agent-home", "GITHUB_TOKEN": ""},
+        image="robomp:dev",
+        container_name="robomp-agent-x",
+    )
+    assert prefix == [
+        "docker", "run", "--rm", "-i", "--init",
+        "--name", "robomp-agent-x",
+        "--entrypoint", "",
+        "--network", "robomp_default",
+        "--volume", "robomp_robomp_data:/data",
+        "--tmpfs", "/data/agent-home/.omp/run:rw,mode=1777",
+        "--workdir", "/data/workspaces/octo/repo",
+        "--user", "2001:2001", "--group-add", "2000",
+        "-e", "HOME=/data/agent-home",
+        "-e", "GITHUB_TOKEN=",
+        "robomp:dev",
+    ]
+
+
+def test_docker_run_prefix_omits_user_without_slot_uid() -> None:
+    workspace = SimpleNamespace(repo_dir=Path("/w/repo"))
+    prefix = worker._docker_run_prefix(
+        settings=_prefix_settings(),
+        workspace=workspace,
+        slot_uid=None,
+        env={},
+        image="robomp:dev",
+        container_name="c",
+    )
+    assert "--user" not in prefix
+    assert "--group-add" not in prefix
+
+
+def test_agent_container_name_sanitized() -> None:
+    name = worker._agent_container_name("Octo/Widget#123" + "x" * 80)
+    assert len(name) <= 63
+    assert name.startswith("robomp-agent-octo-widget-123")
+    import re
+
+    assert re.fullmatch(r"[a-z0-9_.-]+", name)
