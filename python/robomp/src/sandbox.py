@@ -114,6 +114,47 @@ def _short_hex(seed: str | None = None) -> str:
     return secrets.token_hex(4)
 
 
+_AGENT_HOME = Path("/data/agent-home")
+
+
+def _provision_slot_home(ws_root: Path, agent_home: Path) -> Path:
+    """Provision the per-workspace writable HOME (``<ws>/.omp-home``).
+
+    The shared agent-home template is deliberately read-only to slots, but
+    Chromium (and other tools the agent drives) hard-crash when they cannot
+    create ancillary dirs under ``$HOME`` (``.pki``, ``.config``, ``.local``,
+    crashpad state) — the omp shared-browser daemon exited 133 for exactly
+    this reason. Each workspace therefore gets its own writable HOME whose
+    ``.omp`` and ``.agent`` entries are symlinks back into the template, so
+    omp config resolution is unchanged while ``$HOME`` itself is writable.
+
+    ``chown -R``/``chmod -R`` in ``_chown_workspace`` do not dereference
+    symlinks, so the sweep never touches the read-only template through them.
+    """
+    home = ws_root / ".omp-home"
+    home.mkdir(parents=True, exist_ok=True)
+    for name in (".omp", ".agent"):
+        target = agent_home / name
+        if not target.is_dir():
+            continue
+        link = home / name
+        try:
+            st = link.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(st.st_mode):
+                if os.readlink(link) == str(target):
+                    continue
+                link.unlink()
+            else:
+                # A planted non-symlink entry: leave it alone rather than
+                # deleting agent-visible state; config falls back to it.
+                continue
+        link.symlink_to(target)
+    return home
+
+
 def workspace_key(repo: str, number: int) -> str:
     return f"{repo.replace('/', '__')}__{number}"
 
@@ -485,7 +526,9 @@ def _slot_subprocess_kwargs(slot_uid: int | None) -> dict[str, Any]:
     return {"user": slot_uid, "group": slot_uid, "extra_groups": [_SHARED_OMP_GID], "umask": 0o002}
 
 
-def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dict[str, str]:
+def _prepare_slot_runtime_env(
+    workspace: Workspace, slot_uid: int | None, *, agent_home: Path = _AGENT_HOME
+) -> dict[str, str]:
     """Compute the env overlay (TMPDIR + XDG_*) for slot-side subprocesses.
 
     Pure env helper: ownership of the workspace tree (including these XDG
@@ -511,7 +554,7 @@ def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dic
         (base / "omp").mkdir(parents=True, exist_ok=True)
     bun_cache.mkdir(parents=True, exist_ok=True)
 
-    return {
+    env = {
         "TMPDIR": str(tmpdir),
         "TMP": str(tmpdir),
         "TEMP": str(tmpdir),
@@ -520,6 +563,9 @@ def _prepare_slot_runtime_env(workspace: Workspace, slot_uid: int | None) -> dic
         "XDG_CACHE_HOME": str(xdg_cache),
         "BUN_INSTALL_CACHE_DIR": str(bun_cache),
     }
+    if agent_home.is_dir():
+        env["HOME"] = str(_provision_slot_home(workspace.root, agent_home))
+    return env
 
 
 def _provision_runtime_dirs(ws_root: Path) -> None:
@@ -549,6 +595,9 @@ def _provision_runtime_dirs(ws_root: Path) -> None:
         base.mkdir(parents=True, exist_ok=True)
         (base / "omp").mkdir(parents=True, exist_ok=True)
     (xdg_root / "cache" / "bun-install").mkdir(parents=True, exist_ok=True)
+
+    if _AGENT_HOME.is_dir():
+        _provision_slot_home(ws_root, _AGENT_HOME)
 
 
 def _grant_group_bits(path: Path, *, gid: int, bits: int) -> None:

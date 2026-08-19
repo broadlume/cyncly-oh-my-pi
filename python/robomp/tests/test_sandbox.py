@@ -749,6 +749,51 @@ def test_prepare_slot_runtime_env_returns_workspace_private_paths_without_chown(
     assert calls == []
 
 
+def test_prepare_slot_runtime_env_omits_home_without_agent_home_template(tmp_path: Path) -> None:
+    ws = _workspace(tmp_path)
+    env = _prepare_slot_runtime_env(ws, 2001, agent_home=tmp_path / "missing-template")
+    assert "HOME" not in env
+
+
+def test_prepare_slot_runtime_env_provisions_writable_home_with_template_symlinks(tmp_path: Path) -> None:
+    template = tmp_path / "agent-home"
+    (template / ".omp" / "agent").mkdir(parents=True)
+    (template / ".agent").mkdir()
+    ws = _workspace(tmp_path / "ws")
+
+    env = _prepare_slot_runtime_env(ws, 2001, agent_home=template)
+
+    home = ws.root / ".omp-home"
+    assert env["HOME"] == str(home)
+    assert home.is_dir()
+    for name in (".omp", ".agent"):
+        link = home / name
+        assert link.is_symlink()
+        assert link.resolve() == (template / name).resolve()
+    # Idempotent, and a stale symlink target is repaired.
+    (home / ".agent").unlink()
+    (home / ".agent").symlink_to(tmp_path)
+    env2 = _prepare_slot_runtime_env(ws, 2001, agent_home=template)
+    assert env2["HOME"] == str(home)
+    assert (home / ".agent").resolve() == (template / ".agent").resolve()
+
+
+def test_prepare_slot_runtime_env_leaves_planted_non_symlink_home_entry(tmp_path: Path) -> None:
+    template = tmp_path / "agent-home"
+    (template / ".omp").mkdir(parents=True)
+    ws = _workspace(tmp_path / "ws")
+    planted = ws.root / ".omp-home" / ".omp"
+    planted.mkdir(parents=True)
+    marker = planted / "keep.txt"
+    marker.write_text("agent state\n", encoding="utf-8")
+
+    env = _prepare_slot_runtime_env(ws, 2001, agent_home=template)
+
+    assert env["HOME"] == str(ws.root / ".omp-home")
+    assert not planted.is_symlink()
+    assert marker.read_text(encoding="utf-8") == "agent state\n"
+
+
 def test_share_git_metadata_keeps_pool_writable_for_retry_slot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo_dir = tmp_path / "workspaces" / "octo__widget__43" / "repo"
     repo_dir.mkdir(parents=True)

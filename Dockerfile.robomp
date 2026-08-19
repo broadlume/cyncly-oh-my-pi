@@ -149,7 +149,8 @@ RUN pip install --no-cache-dir \
 # and a read-only host mount at /srv/agent-home-override. The entrypoint copies
 # layer 1 then layer 2 into root-owned world-readable files under
 # /data/agent-home (on the shared volume, visible to agent containers); the
-# agent runs with HOME=/data/agent-home, so ~/.omp and ~/.agent resolve there.
+# agent runs with a writable per-workspace HOME (<ws>/.omp-home) whose ~/.omp
+# and ~/.agent are symlinks back into /data/agent-home.
 RUN mkdir -p /srv/agent-home-stage/.agent /srv/agent-home-stage/.omp/agent
 
 # Versioned agent-config bundle (layer 1); its tree is a literal image of $HOME.

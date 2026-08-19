@@ -233,6 +233,8 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     _stage_agent_home()
     _ensure_agent_run_dir()
     env = dict.fromkeys(_SCRUBBED_ENV_KEYS, "")
+    # Baseline only: _prepare_slot_runtime_env overrides HOME with the writable
+    # per-workspace <ws>/.omp-home (symlinked back into the template).
     if _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
     return env
