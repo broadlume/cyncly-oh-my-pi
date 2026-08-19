@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from robomp import tasks
-from robomp.github_client import IssueInfo, RepoInfo
+from robomp.github_client import IssueInfo, PullRequestInfo, RepoInfo
 
 
 async def test_triage_issue_keeps_event_loop_live_while_workspace_setup_blocks(db, settings, monkeypatch, tmp_path):
@@ -235,3 +235,317 @@ async def test_triage_issue_reopen_tears_down_finalized_workspace(db, settings, 
     row = db.get_issue("octo/widget#1")
     assert row is not None
     assert row.state == "reproducing"
+
+
+# --- writable PR work via bot assignment -------------------------------------
+
+
+def _pr_info(**overrides) -> PullRequestInfo:
+    fields = {
+        "repo": "octo/widget",
+        "number": 7,
+        "html_url": "https://github.com/octo/widget/pull/7",
+        "head_ref": "feat/x",
+        "base_ref": "main",
+        "state": "open",
+        "author": "alice",
+        "head_repo": "octo/widget",
+        "assignees": ("robomp-bot",),
+    }
+    fields.update(overrides)
+    return PullRequestInfo(**fields)
+
+
+def _pr_comment_payload(*, pr_number: int = 7) -> dict:
+    """`issue_comment.created` on a PR, no maintainer directive attached."""
+    return {
+        "repository": {
+            "full_name": "octo/widget",
+            "default_branch": "main",
+            "clone_url": "https://x/octo/widget.git",
+            "private": False,
+        },
+        "issue": {
+            "number": pr_number,
+            "title": "add widget",
+            "body": "pr body",
+            "state": "open",
+            "user": {"login": "alice"},
+            "pull_request": {"url": f"https://api.github.com/repos/octo/widget/pulls/{pr_number}"},
+        },
+        "comment": {
+            "id": 42,
+            "body": "please tweak this",
+            "created_at": "2026-01-01T00:00:00Z",
+            "user": {"login": "alice"},
+        },
+    }
+
+
+class _FakePRGitHub:
+    """Minimal backend for the PR-conversation path; records posted comments."""
+
+    def __init__(self, pr: PullRequestInfo) -> None:
+        self.pr = pr
+        self.comments: list[tuple[str, int, str]] = []
+
+    async def get_pull_request(self, repo: str, number: int) -> PullRequestInfo:
+        assert repo == "octo/widget"
+        assert number == self.pr.number
+        return self.pr
+
+    async def get_repo(self, repo: str) -> RepoInfo:
+        return RepoInfo(
+            full_name=repo,
+            default_branch="main",
+            clone_url="https://x/octo/widget.git",
+            private=False,
+        )
+
+    async def get_issue(self, repo: str, number: int) -> IssueInfo:
+        return IssueInfo(
+            repo=repo,
+            number=number,
+            title="add widget",
+            body="pr body",
+            state="open",
+            author="alice",
+            labels=(),
+            is_pull_request=True,
+        )
+
+    async def post_comment(self, repo: str, number: int, body: str) -> None:
+        self.comments.append((repo, number, body))
+
+
+def _pr_conversation_harness(monkeypatch, tmp_path, *, head_ref: str = "feat/x"):
+    """Stub run_task/_fetch_thread and hand back a recording sandbox."""
+    captured: dict[str, object] = {}
+    ensure_calls: list[dict] = []
+    removed: list[int] = []
+
+    def _ensure(**kwargs):
+        ensure_calls.append(kwargs)
+        return SimpleNamespace(branch=head_ref, session_dir=str(tmp_path / "sess"))
+
+    def _remove(**kwargs):
+        removed.append(int(kwargs["number"]))
+
+    async def _fake_run_task(*, task_kind: str, inputs, **_kwargs):
+        del inputs
+        captured["task_kind"] = task_kind
+
+    async def _no_thread(*_a, **_k):
+        return ()
+
+    monkeypatch.setattr(tasks, "run_task", _fake_run_task)
+    monkeypatch.setattr(tasks, "_fetch_thread", _no_thread)
+
+    sandbox = SimpleNamespace(natives_cache=None, ensure_workspace=_ensure, remove_workspace=_remove)
+    return sandbox, captured, ensure_calls, removed
+
+
+def test_can_handle_pr_directly_allows_assigned_non_author_same_repo(settings) -> None:
+    assert (
+        tasks._can_handle_pr_directly(settings=settings, repo_full="octo/widget", pr=_pr_info())
+        is True
+    )
+
+
+def test_can_handle_pr_directly_rejects_assigned_fork_pr(settings) -> None:
+    """The bot token cannot push to a fork, so assignment grants nothing there."""
+    pr = _pr_info(head_repo="contrib/widget")
+    assert tasks._can_handle_pr_directly(settings=settings, repo_full="octo/widget", pr=pr) is False
+
+
+def test_can_handle_pr_directly_rejects_unassigned_foreign_pr(settings) -> None:
+    pr = _pr_info(assignees=("bob",))
+    assert tasks._can_handle_pr_directly(settings=settings, repo_full="octo/widget", pr=pr) is False
+
+
+async def test_handle_pr_conversation_untracked_assigned_pr_creates_writable_row(
+    db, settings, monkeypatch, tmp_path
+) -> None:
+    """An assigned contributor PR with no DB row gets a head-branch row lazily."""
+    sandbox, captured, ensure_calls, _removed = _pr_conversation_harness(monkeypatch, tmp_path)
+
+    await tasks.handle_pr_conversation(
+        settings=settings,
+        db=db,
+        github=_FakePRGitHub(_pr_info()),
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_comment_payload(),
+        delivery_id="d-assigned",
+    )
+
+    assert [c["existing_branch"] for c in ensure_calls] == ["feat/x"]
+    row = db.get_issue("octo/widget#7")
+    assert row is not None
+    assert (row.state, row.branch, row.pr_number) == ("opened", "feat/x", 7)
+    assert captured["task_kind"] == "handle_comment"
+
+
+async def test_handle_pr_conversation_reclaims_review_row_when_assigned(
+    db, settings, monkeypatch, tmp_path
+) -> None:
+    """A leftover read-only review row is converted to the writable head branch."""
+    db.upsert_issue(
+        key="octo/widget#7",
+        repo="octo/widget",
+        number=7,
+        state="reviewing",
+        branch="review/pr-7",
+        pr_number=7,
+    )
+    sandbox, captured, ensure_calls, removed = _pr_conversation_harness(monkeypatch, tmp_path)
+
+    await tasks.handle_pr_conversation(
+        settings=settings,
+        db=db,
+        github=_FakePRGitHub(_pr_info()),
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_comment_payload(),
+        delivery_id="d-reclaim",
+    )
+
+    # The detached review worktree cannot be re-pointed, so it is torn down first.
+    assert removed == [7]
+    row = db.get_issue("octo/widget#7")
+    assert row is not None
+    assert (row.state, row.branch) == ("opened", "feat/x")
+    assert [c["existing_branch"] for c in ensure_calls] == ["feat/x"]
+    assert captured["task_kind"] == "handle_comment"
+
+
+async def test_handle_pr_conversation_keeps_skipping_review_row_when_not_assigned(
+    db, settings, monkeypatch, tmp_path
+) -> None:
+    db.upsert_issue(
+        key="octo/widget#7",
+        repo="octo/widget",
+        number=7,
+        state="reviewing",
+        branch="review/pr-7",
+        pr_number=7,
+    )
+    sandbox, captured, ensure_calls, removed = _pr_conversation_harness(monkeypatch, tmp_path)
+
+    await tasks.handle_pr_conversation(
+        settings=settings,
+        db=db,
+        github=_FakePRGitHub(_pr_info(assignees=())),
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_comment_payload(),
+        delivery_id="d-no-reclaim",
+    )
+
+    assert removed == []
+    assert ensure_calls == []
+    assert "task_kind" not in captured
+    row = db.get_issue("octo/widget#7")
+    assert row is not None
+    assert (row.state, row.branch) == ("reviewing", "review/pr-7")
+
+
+async def test_handle_pr_conversation_revives_terminal_row_for_reopened_assigned_pr(
+    db, settings, monkeypatch, tmp_path
+) -> None:
+    """No `reopened` handler exists; the fresh open PR state is what proves revival."""
+    db.upsert_issue(
+        key="octo/widget#7",
+        repo="octo/widget",
+        number=7,
+        state="closed",
+        branch="feat/x",
+        pr_number=7,
+    )
+    sandbox, captured, ensure_calls, removed = _pr_conversation_harness(monkeypatch, tmp_path)
+    github = _FakePRGitHub(_pr_info())
+
+    await tasks.handle_pr_conversation(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_comment_payload(),
+        delivery_id="d-revive",
+    )
+
+    assert removed == [7]
+    row = db.get_issue("octo/widget#7")
+    assert row is not None
+    assert (row.state, row.branch) == ("opened", "feat/x")
+    assert [c["existing_branch"] for c in ensure_calls] == ["feat/x"]
+    assert captured["task_kind"] == "handle_comment"
+    assert github.comments == []
+
+
+async def test_handle_pr_conversation_still_acks_terminal_row_for_closed_pr(
+    db, settings, monkeypatch, tmp_path
+) -> None:
+    db.upsert_issue(
+        key="octo/widget#7",
+        repo="octo/widget",
+        number=7,
+        state="closed",
+        branch="feat/x",
+        pr_number=7,
+    )
+    sandbox, captured, ensure_calls, removed = _pr_conversation_harness(monkeypatch, tmp_path)
+    github = _FakePRGitHub(_pr_info(state="closed"))
+
+    await tasks.handle_pr_conversation(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=SimpleNamespace(),
+        payload=_pr_comment_payload(),
+        delivery_id="d-finalized",
+    )
+
+    assert removed == []
+    assert ensure_calls == []
+    assert "task_kind" not in captured
+    assert [(repo, number) for repo, number, _body in github.comments] == [("octo/widget", 7)]
+
+
+async def test_revoke_pr_assignment_removes_workspace_and_row(db, settings) -> None:
+    db.upsert_issue(
+        key="octo/widget#7",
+        repo="octo/widget",
+        number=7,
+        state="opened",
+        branch="feat/x",
+        pr_number=7,
+    )
+    removed: list[int] = []
+    sandbox = SimpleNamespace(remove_workspace=lambda **kwargs: removed.append(int(kwargs["number"])))
+
+    await tasks.revoke_pr_assignment(
+        settings=settings,
+        db=db,
+        sandbox=sandbox,
+        payload={"repository": {"full_name": "octo/widget"}, "pull_request": {"number": 7}},
+    )
+
+    assert removed == [7]
+    assert db.get_issue("octo/widget#7") is None
+
+
+async def test_revoke_pr_assignment_without_row_is_noop(db, settings) -> None:
+    def _boom(**_kwargs):
+        raise AssertionError("no workspace should be touched when no row exists")
+
+    await tasks.revoke_pr_assignment(
+        settings=settings,
+        db=db,
+        sandbox=SimpleNamespace(remove_workspace=_boom),
+        payload={"repository": {"full_name": "octo/widget"}, "pull_request": {"number": 7}},
+    )
+
+    assert db.get_issue("octo/widget#7") is None

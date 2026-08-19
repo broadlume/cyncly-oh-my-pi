@@ -483,6 +483,13 @@ class WorkerPool:
                 payload=row.payload,
                 target_state=target_state,
             )
+        elif event == "pull_request" and action == "unassigned":
+            await tasks.revoke_pr_assignment(
+                settings=self.settings,
+                db=self.db,
+                sandbox=self.sandbox,
+                payload=row.payload,
+            )
         else:
             log.info("no-op dispatch", extra={"event": event, "action": action})
 

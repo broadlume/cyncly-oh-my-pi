@@ -619,6 +619,7 @@ def _pr_from(data: Any) -> PullRequestInfo:
         head_repo=str(data.get("head_repo") or ""),
         title=str(data.get("title") or ""),
         body=str(data.get("body") or ""),
+        assignees=tuple(str(x) for x in (data.get("assignees") or []) if isinstance(x, str)),
     )
 
 

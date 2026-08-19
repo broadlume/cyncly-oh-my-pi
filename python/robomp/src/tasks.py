@@ -246,13 +246,14 @@ async def _resolve_issue_row_for_pr(
 
 
 def _can_handle_pr_directly(*, settings: Settings, repo_full: str, pr: PullRequestInfo) -> bool:
-    """Only bot-owned same-repo PR branches are safe to amend directly."""
+    """Only bot-owned or bot-assigned same-repo PR branches are safe to amend directly."""
     if not pr.head_ref:
         log.info("skip: PR has no head ref", extra={"repo": repo_full, "pr": pr.number})
         return False
-    if pr.author.lower() != settings.bot_login.lower():
+    bot = settings.bot_login.lower()
+    if pr.author.lower() != bot and not any(a.lower() == bot for a in pr.assignees):
         log.info(
-            "skip: unmapped PR not authored by bot",
+            "skip: unmapped PR neither bot-authored nor bot-assigned",
             extra={"repo": repo_full, "pr": pr.number, "author": pr.author},
         )
         return False
@@ -263,6 +264,49 @@ def _can_handle_pr_directly(*, settings: Settings, repo_full: str, pr: PullReque
         )
         return False
     return True
+
+
+async def _reclaim_assigned_pr_row(
+    *,
+    settings: Settings,
+    db: Database,
+    github: GitHubBackend,
+    sandbox: SandboxManager,
+    repo_full: str,
+    pr_number: int,
+    issue_row: IssueRow,
+) -> IssueRow | None:
+    """If the bot is currently assigned to this open same-repo PR, convert a
+    review-shaped or finalized own-key row into a writable head-branch row.
+
+    Returns the refreshed row, or None when reclaim does not apply.
+    """
+    key = issue_key(repo_full, pr_number)
+    if issue_row.key != key:
+        return None
+    try:
+        pr = await github.get_pull_request(repo_full, pr_number)
+    except GitHubError as exc:
+        log.warning("reclaim PR fetch failed", extra={"repo": repo_full, "pr": pr_number, "err": str(exc)})
+        return None
+    bot = settings.bot_login.lower()
+    if (
+        pr.state != "open"
+        or not any(a.lower() == bot for a in pr.assignees)
+        or pr.head_repo.lower() != repo_full.lower()
+        or not pr.head_ref
+    ):
+        return None
+    await _run_workspace_op(sandbox.remove_workspace, repo=repo_full, number=pr_number)
+    db.upsert_issue(
+        key=key,
+        repo=repo_full,
+        number=pr_number,
+        state="opened",
+        branch=pr.head_ref,
+        pr_number=pr_number,
+    )
+    return db.get_issue(key)
 
 
 async def triage_issue(
@@ -631,6 +675,20 @@ async def handle_review(
         issue_number = pr_number
         existing_branch = pr_info.head_ref
     else:
+        if issue_row.key == issue_key(repo_full, pr_number) and (
+            issue_row.state == "reviewing" or (issue_row.branch or "").startswith("review/pr-")
+        ):
+            reclaimed = await _reclaim_assigned_pr_row(
+                settings=settings,
+                db=db,
+                github=github,
+                sandbox=sandbox,
+                repo_full=repo_full,
+                pr_number=pr_number,
+                issue_row=issue_row,
+            )
+            if reclaimed is not None:
+                issue_row = reclaimed
         if issue_row.branch is None:
             log.info("skip: review PR missing branch mapping", extra={"repo": repo_full, "pr": pr_number})
             return
@@ -732,10 +790,34 @@ async def handle_pr_conversation(
             return
     directive = _directive_from_payload(payload)
     if issue_row is not None and issue_row.state == "reviewing":
-        log.info("skip: incoming PR conversation unsupported", extra={"key": issue_row.key, "pr": pr_number})
-        return
+        reclaimed = await _reclaim_assigned_pr_row(
+            settings=settings,
+            db=db,
+            github=github,
+            sandbox=sandbox,
+            repo_full=repo_full,
+            pr_number=pr_number,
+            issue_row=issue_row,
+        )
+        if reclaimed is None:
+            log.info("skip: incoming PR conversation unsupported", extra={"key": issue_row.key, "pr": pr_number})
+            return
+        issue_row = reclaimed
     if issue_row is not None and issue_row.state in ("merged", "closed", "abandoned"):
+        reclaimed = None
         if directive is None:
+            reclaimed = await _reclaim_assigned_pr_row(
+                settings=settings,
+                db=db,
+                github=github,
+                sandbox=sandbox,
+                repo_full=repo_full,
+                pr_number=pr_number,
+                issue_row=issue_row,
+            )
+        if reclaimed is not None:
+            issue_row = reclaimed
+        elif directive is None:
             log.info("skip: pr-conversation on finalized issue", extra={"key": issue_row.key, "state": issue_row.state})
             # Still acknowledge so the reporter knows the bot saw it.
             try:
@@ -747,16 +829,17 @@ async def handle_pr_conversation(
             except GitHubError as exc:
                 log.warning("ack comment failed", extra={"err": str(exc)})
             return
-        # Maintainer reopen on a finalized PR: tear down stale workspace and
-        # branch afresh on the originating issue. The agent will open a new
-        # PR if code changes ship.
-        log.info(
-            "directive reopen (pr)",
-            extra={"key": issue_row.key, "from_state": issue_row.state, "author": directive.author},
-        )
-        await _run_workspace_op(sandbox.remove_workspace, repo=issue_row.repo, number=issue_row.number)
-        db.upsert_issue(key=issue_row.key, repo=issue_row.repo, number=issue_row.number, state="reproducing")
-        issue_row = db.get_issue(issue_row.key) or issue_row
+        else:
+            # Maintainer reopen on a finalized PR: tear down stale workspace and
+            # branch afresh on the originating issue. The agent will open a new
+            # PR if code changes ship.
+            log.info(
+                "directive reopen (pr)",
+                extra={"key": issue_row.key, "from_state": issue_row.state, "author": directive.author},
+            )
+            await _run_workspace_op(sandbox.remove_workspace, repo=issue_row.repo, number=issue_row.number)
+            db.upsert_issue(key=issue_row.key, repo=issue_row.repo, number=issue_row.number, state="reproducing")
+            issue_row = db.get_issue(issue_row.key) or issue_row
     # Bare @mention with no request body — the route stashes an empty
     # _robomp_directive; _directive_from_payload rejects it but the key
     # being present tells us a mention happened. Reply cheaply without omp.
@@ -880,11 +963,36 @@ async def cleanup_workspace(
     log.info("cleanup", extra={"key": issue_row.key, "state": target_state})
 
 
+async def revoke_pr_assignment(
+    *,
+    settings: Settings,
+    db: Database,
+    sandbox: SandboxManager,
+    payload: Mapping[str, Any],
+) -> None:
+    """Tear down state for a PR the bot was unassigned from."""
+    repo_payload = payload.get("repository") or {}
+    repo_full = str(repo_payload.get("full_name") or "")
+    if not repo_full:
+        return
+    pr_payload = payload.get("pull_request") or {}
+    number = pr_payload.get("number")
+    if not isinstance(number, int):
+        return
+    row = db.get_issue(issue_key(repo_full, number))
+    if row is None:
+        return
+    await _run_workspace_op(sandbox.remove_workspace, repo=repo_full, number=number)
+    db.delete_issue(row.key)
+    log.info("pr assignment revoked", extra={"key": row.key})
+
+
 __all__ = [
     "cleanup_workspace",
     "handle_comment",
     "handle_pr_conversation",
     "handle_review",
+    "revoke_pr_assignment",
     "review_pr",
     "triage_issue",
 ]

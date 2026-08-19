@@ -1170,3 +1170,138 @@ def test_route_non_directive_comment_carries_no_pragmas() -> None:
     )
     assert decision.directive is False
     assert decision.directive_pragmas == ()
+
+
+def _assigned_pr_comment_payload(assignees: list[dict[str, str]], **issue_extra: object) -> dict[str, object]:
+    issue: dict[str, object] = {
+        "number": 9,
+        "user": {"login": "contributor"},
+        "pull_request": {"url": "x"},
+        "assignees": assignees,
+    }
+    issue.update(issue_extra)
+    return {
+        "action": "created",
+        "comment": {"user": {"login": "alice"}, "body": "ping"},
+        "issue": issue,
+        "repository": {"full_name": "octo/widget"},
+    }
+
+
+def test_route_pr_comment_on_bot_assigned_pr_queues_conversation() -> None:
+    decision = route(
+        "issue_comment",
+        _assigned_pr_comment_payload([{"login": "alice"}, {"login": BOT}]),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: None,
+    )
+    assert decision.should_queue
+    assert decision.task == "handle_pr_conversation"
+    assert decision.issue_key == "octo/widget#9"
+    assert decision.submitter == "alice"
+
+
+def test_route_pr_comment_reviewer_only_role_grants_nothing() -> None:
+    # Being a requested reviewer is read-only capability: no writable conversation.
+    decision = route(
+        "issue_comment",
+        _assigned_pr_comment_payload([], requested_reviewers=[{"login": BOT}]),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "incoming PR comments ignored"
+
+
+def test_route_pr_comment_after_unassignment_skips() -> None:
+    decision = route(
+        "issue_comment",
+        _assigned_pr_comment_payload([{"login": "alice"}]),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "incoming PR comments ignored"
+
+
+def test_route_review_comment_on_bot_assigned_pr_queues_handle_review() -> None:
+    decision = route(
+        "pull_request_review_comment",
+        {
+            "action": "created",
+            "comment": {"user": {"login": "alice"}, "body": "nit"},
+            "pull_request": {
+                "number": 9,
+                "user": {"login": "contributor"},
+                "assignees": [{"login": BOT}],
+            },
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: None,
+    )
+    assert decision.should_queue
+    assert decision.task == "handle_review"
+    assert decision.issue_key == "octo/widget#9"
+
+
+def _unassigned_payload(assignee: str, pr_author: str) -> dict[str, object]:
+    return {
+        "action": "unassigned",
+        "assignee": {"login": assignee},
+        "pull_request": {"number": 9, "user": {"login": pr_author}},
+        "repository": {"full_name": "octo/widget"},
+    }
+
+
+def test_route_pr_unassigned_from_bot_queues_revoke() -> None:
+    decision = route(
+        "pull_request",
+        _unassigned_payload(BOT, "contributor"),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+        resolve_issue_from_pr=lambda _r, _n: "octo/widget#42",
+    )
+    assert decision.should_queue
+    assert decision.task == "revoke_pr_assignment"
+    assert decision.issue_key == "octo/widget#9"
+
+
+def test_route_pr_unassigned_from_other_user_skips() -> None:
+    decision = route(
+        "pull_request",
+        _unassigned_payload("alice", "contributor"),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "unassigned someone else"
+
+
+def test_route_pr_unassigned_on_bot_authored_pr_keeps_workspace() -> None:
+    decision = route(
+        "pull_request",
+        _unassigned_payload(BOT, BOT),
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "bot-authored PR keeps its workspace"
+
+
+def test_route_pr_assigned_is_not_handled() -> None:
+    decision = route(
+        "pull_request",
+        {
+            "action": "assigned",
+            "assignee": {"login": BOT},
+            "pull_request": {"number": 9, "user": {"login": "contributor"}},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert decision.reason == "pull_request.assigned not handled"

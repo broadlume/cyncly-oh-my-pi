@@ -30,7 +30,7 @@ from robomp.github_client import (
     ReviewCommentInfo,
 )
 from robomp.proxy.server import create_proxy_app
-from robomp.proxy_client import GitHubProxyClient, ProxyGitTransport
+from robomp.proxy_client import GitHubProxyClient, ProxyGitTransport, _pr_from
 from robomp.proxy_hmac import HEADER_SIGNATURE, HEADER_TIMESTAMP, verify
 from robomp.sandbox import workspace_key
 
@@ -627,3 +627,37 @@ def test_proxy_git_transport_post_headers_verify() -> None:
     )
     assert result.ok, result.reason
     assert json.loads(req.content)["repo"] == "octo/widget"
+
+
+def test_pr_from_parses_assignees_string_list() -> None:
+    pr = _pr_from(
+        {
+            "repo": "octo/widget",
+            "number": 9,
+            "html_url": "https://example/9",
+            "head_ref": "fix",
+            "head_repo": "octo/widget",
+            "base_ref": "main",
+            "state": "open",
+            "author": "contributor",
+            "assignees": ["alice", "robomp-bot", 7],
+        }
+    )
+    assert isinstance(pr, PullRequestInfo)
+    assert pr.assignees == ("alice", "robomp-bot")
+
+
+def test_pr_from_without_assignees_yields_empty_tuple() -> None:
+    pr = _pr_from(
+        {
+            "repo": "octo/widget",
+            "number": 9,
+            "html_url": "https://example/9",
+            "head_ref": "fix",
+            "head_repo": "octo/widget",
+            "base_ref": "main",
+            "state": "open",
+            "author": "contributor",
+        }
+    )
+    assert pr.assignees == ()

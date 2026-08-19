@@ -69,6 +69,7 @@ class PullRequestInfo:
     head_repo: str = ""
     title: str = ""
     body: str = ""
+    assignees: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -769,6 +770,11 @@ def _pr_from_payload(repo: str, data: Mapping[str, Any]) -> PullRequestInfo:
         head_repo=str(head_repo.get("full_name") or "") if isinstance(head_repo, Mapping) else "",
         title=str(data.get("title") or ""),
         body=str(data.get("body") or ""),
+        assignees=tuple(
+            str(u.get("login") or "")
+            for u in (data.get("assignees") or [])
+            if isinstance(u, Mapping) and u.get("login")
+        ),
     )
 
 

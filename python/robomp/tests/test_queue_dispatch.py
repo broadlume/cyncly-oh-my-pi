@@ -153,3 +153,20 @@ async def test_dispatch_incoming_pr_rereview_comment_routes_to_review_pr(
     assert len(seen) == 1
     assert seen[0]["force_rereview"] is True
 
+
+@pytest.mark.asyncio
+async def test_dispatch_pr_unassigned_routes_to_revoke_pr_assignment(
+    settings: Settings, db: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unassigning the bot MUST tear down the PR's writable state."""
+    seen: list[str] = []
+
+    async def fake_revoke(*, payload, **_kwargs) -> None:
+        seen.append(str(payload.get("action")))
+
+    monkeypatch.setattr(tasks, "revoke_pr_assignment", fake_revoke)
+
+    await _make_pool(settings, db)._dispatch(_pr_row("unassigned"))  # noqa: SLF001
+
+    assert seen == ["unassigned"]
+

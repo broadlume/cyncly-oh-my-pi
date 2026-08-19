@@ -127,6 +127,15 @@ def _is_bot_account(user: Mapping[str, Any] | None, bot_login: str) -> bool:
     return False
 
 
+def _bot_in_assignees(assignees: Any, bot_login: str) -> bool:
+    if not isinstance(assignees, list):
+        return False
+    return any(
+        isinstance(u, Mapping) and _login_matches_bot(str(u.get("login") or ""), bot_login)
+        for u in assignees
+    )
+
+
 def _submitter_info(obj: Mapping[str, Any] | None) -> tuple[str | None, str | None]:
     """Extract `(login, author_association)` from an issue/comment object."""
     if not isinstance(obj, Mapping):
@@ -345,7 +354,9 @@ def route(
             assoc = _effective_association(login, assoc, payload.get("repository"), repo)
             issue_user_raw = issue.get("user")
             issue_user = issue_user_raw if isinstance(issue_user_raw, Mapping) else {}
-            if _login_matches_bot(str(issue_user.get("login") or ""), bot_login):
+            if _login_matches_bot(str(issue_user.get("login") or ""), bot_login) or _bot_in_assignees(
+                issue.get("assignees"), bot_login
+            ):
                 return RouteDecision(
                     "queue",
                     "handle_pr_conversation",
@@ -413,8 +424,11 @@ def route(
             return RouteDecision("skip", None, repo, None, "bot/self review comment")
         pr = payload.get("pull_request") or {}
         pr_user = pr.get("user") or {}
-        if not _login_matches_bot(str(pr_user.get("login") or ""), bot_login):
-            return RouteDecision("skip", None, repo, None, "PR not authored by bot")
+        if not (
+            _login_matches_bot(str(pr_user.get("login") or ""), bot_login)
+            or _bot_in_assignees(pr.get("assignees"), bot_login)
+        ):
+            return RouteDecision("skip", None, repo, None, "PR not authored by or assigned to bot")
         number = pr.get("number")
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "PR missing number")
@@ -439,6 +453,21 @@ def route(
             return RouteDecision("skip", None, repo, None, "PR missing number")
         reason = "pull_request.merged" if bool(pr.get("merged")) else "pull_request.closed"
         return RouteDecision("queue", "cleanup_workspace", repo, _resolve_pr_key(number), reason)
+
+    if event_type == "pull_request" and action == "unassigned":
+        pr = payload.get("pull_request") or {}
+        number = pr.get("number")
+        if not isinstance(number, int):
+            return RouteDecision("skip", None, repo, None, "PR missing number")
+        assignee = payload.get("assignee") or {}
+        if not _login_matches_bot(str(assignee.get("login") or ""), bot_login):
+            return RouteDecision("skip", None, repo, None, "unassigned someone else")
+        pr_user = pr.get("user") or {}
+        if _login_matches_bot(str(pr_user.get("login") or ""), bot_login):
+            return RouteDecision("skip", None, repo, None, "bot-authored PR keeps its workspace")
+        return RouteDecision(
+            "queue", "revoke_pr_assignment", repo, issue_key(repo, number), "pull_request.unassigned"
+        )
 
     return RouteDecision("skip", None, repo, None, f"{event_type}.{action} not handled")
 

@@ -802,6 +802,12 @@ class Database:
             classification=row["classification"],
         )
 
+    def delete_issue(self, key: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM issues WHERE key=?", (key,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
     def find_issue_by_pr(self, repo: str, pr_number: int) -> IssueRow | None:
         with self._lock:
             row = self._conn.execute(
