@@ -7,6 +7,7 @@ import json
 import subprocess
 import threading
 from pathlib import Path
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -448,6 +449,98 @@ def test_gh_post_comment_propagates_github_error(db: Database, tmp_path: Path) -
         with pytest.raises(RpcCommandError) as exc:
             tool.execute({"body": "hi"}, _ctx())
         assert "422" in str(exc.value)
+    finally:
+        _stop_loop(loop, t)
+
+
+def test_gh_close_issue_patches_state_and_cancels_autoclose(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["json"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(handler))
+    db.upsert_pending_closure(
+        issue_key=bindings.issue_key,
+        repo="octo/widget",
+        number=42,
+        comment_id=7,
+        issue_author="alice",
+        close_at="2999-01-01T00:00:00.000000Z",
+    )
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_close_issue")
+        result = tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+    assert result == "closed #42 as completed"
+    assert captured["method"] == "PATCH"
+    assert captured["path"] == "/repos/octo/widget/issues/42"
+    assert captured["json"] == {"state": "closed", "state_reason": "completed"}
+    row = db._conn.execute(
+        "SELECT state, cancel_reason FROM pending_closures WHERE issue_key = ?", (bindings.issue_key,)
+    ).fetchone()
+    assert (row["state"], row["cancel_reason"]) == ("cancelled", "closed_by_agent")
+
+
+def test_gh_close_issue_not_planned_reason(db: Database, tmp_path: Path) -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(handler))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_close_issue")
+        result = tool.execute({"reason": "not_planned"}, _ctx())
+    finally:
+        _stop_loop(loop, t)
+    assert result == "closed #42 as not_planned"
+    assert captured["json"] == {"state": "closed", "state_reason": "not_planned"}
+
+
+def test_gh_close_issue_rejects_invalid_reason(db: Database, tmp_path: Path) -> None:
+    bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(lambda r: httpx.Response(500)))
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_close_issue")
+        with pytest.raises(RpcCommandError) as exc:
+            tool.execute({"reason": "reopened"}, _ctx())
+        assert "invalid reason" in str(exc.value)
+    finally:
+        _stop_loop(loop, t)
+
+
+def test_gh_close_issue_rejects_review_mode(db: Database, tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={})
+
+    bindings, loop, t = _bindings(db, tmp_path, httpx.MockTransport(handler))
+    bindings = replace(bindings, review_mode=True)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_close_issue")
+        with pytest.raises(RpcCommandError) as exc:
+            tool.execute({}, _ctx())
+        assert "read-only" in str(exc.value)
+    finally:
+        _stop_loop(loop, t)
+    assert calls == []
+
+
+def test_gh_close_issue_propagates_github_error(db: Database, tmp_path: Path) -> None:
+    transport = httpx.MockTransport(lambda r: httpx.Response(403, json={"message": "Forbidden"}))
+    bindings, loop, t = _bindings(db, tmp_path, transport)
+    try:
+        tool = next(x for x in build(bindings) if x.name == "gh_close_issue")
+        with pytest.raises(RpcCommandError) as exc:
+            tool.execute({}, _ctx())
+        assert "403" in str(exc.value)
     finally:
         _stop_loop(loop, t)
 

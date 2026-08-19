@@ -89,7 +89,7 @@ ONE `gh_post_comment`: restate change; feasibility/scope/tradeoffs; maintainer-d
 ONE `gh_post_comment`: acknowledge technical accuracy without strawmanning; explain intentional tradeoff/design or actual upstream owner, citing code/docs path; state assessment-changing evidence (real failing workflow or violated documented contract); defer final call, do not close. No repro/branch/PR; NEVER implement because small—maintainer decides.
 
 ## `primary == "invalid"` or `primary == "duplicate"`
-ONE brief `gh_post_comment`: `invalid` explain off-topic/not-actionable/spam courteously (genuine spam: label + one-line note); `duplicate` original link, one sentence. Stop.
+ONE brief `gh_post_comment`: `invalid` explain off-topic/not-actionable/spam courteously (genuine spam: label + one-line note); `duplicate` original link, one sentence. Then `gh_close_issue(reason="not_planned")`. Stop.
 
 # PR body (`bug`/`documentation` only)
 Verbatim section order; no other top-level headings:

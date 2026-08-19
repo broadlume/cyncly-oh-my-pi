@@ -638,6 +638,57 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
         execute=execute,
     )
 
+# ---------- gh_close_issue ----------
+_CLOSE_REASONS: tuple[str, ...] = ("completed", "not_planned")
+
+
+def _build_close_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
+    def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
+        if bindings.review_mode:
+            msg = "refusing to close issue: PR review tasks are read-only."
+            _audit(bindings, "gh_close_issue", args, error=msg)
+            _raise_command(msg)
+        reason = str(args.get("reason") or "completed")
+        if reason not in _CLOSE_REASONS:
+            _raise_command(f"gh_close_issue: invalid reason {reason!r}; expected one of {list(_CLOSE_REASONS)}.")
+        number = bindings.issue.number
+        try:
+            _run_coro(
+                bindings.loop,
+                bindings.github.close_issue(bindings.repo.full_name, number, reason=reason),
+            )
+        except GitHubError as exc:
+            _audit(bindings, "gh_close_issue", args, error=str(exc))
+            _raise_command(f"GitHub rejected close: {exc.status} {exc.message}")
+        # A scheduled question auto-close is now moot; cancel it directly so the
+        # scheduler never PATCHes an already-closed issue (the `issues.closed`
+        # webhook also cancels, but delivery can lag).
+        cancelled = bindings.db.cancel_pending_closure(bindings.issue_key, reason="closed_by_agent")
+        result: dict[str, Any] = {"number": number, "reason": reason}
+        if cancelled:
+            result["cancelled_autoclose"] = True
+        _audit(bindings, "gh_close_issue", args, result=result)
+        return f"closed #{number} as {reason}"
+
+    return host_tool(
+        name="gh_close_issue",
+        description=persona.host_tool_description("gh_close_issue"),
+        parameters={
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "enum": list(_CLOSE_REASONS),
+                    "default": "completed",
+                    "description": persona.host_tool_parameter_description("gh_close_issue", "reason"),
+                },
+            },
+            "additionalProperties": False,
+        },
+        execute=execute,
+    )
+
+
 
 def _repair_message_escapes(message: str) -> str | None:
     """Convert shell-literal ``\\n`` escapes in a commit message to newlines.
@@ -2036,6 +2087,7 @@ def build(bindings: ToolBindings) -> tuple[HostTool[Any, Any], ...]:
         _build_pr_review_comment(bindings),
         _build_submit_pr_review(bindings),
         _build_post_comment(bindings),
+        _build_close_issue(bindings),
         _build_push_branch(bindings),
         _build_open_pr(bindings),
         _build_request_review(bindings),

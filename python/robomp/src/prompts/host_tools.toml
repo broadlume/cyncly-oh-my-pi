@@ -79,6 +79,12 @@ description = "Search issues AND pull requests in the current repo. Served from 
 query = "GitHub issue-search syntax: bare keywords plus qualifiers like `is:pr`, `is:closed`, `is:merged`, `label:bug`, `author:<login>`. NEVER include a `repo:` qualifier — scope is applied automatically."
 limit = "Max results, 1-20. Default 10."
 
+[gh_close_issue]
+description = "Close the originating issue on GitHub. Use only after posting your final comment, and only when the thread is resolved: an answered `question`, or an `invalid`/`duplicate` issue. Closing is a strong signal — when in doubt, leave the issue open for the maintainer. A maintainer reopen re-triages from scratch."
+
+[gh_close_issue.parameters]
+reason = "GitHub state_reason: `completed` for a resolved/answered issue, `not_planned` for invalid or duplicate. Default `completed`."
+
 [search_commits]
 description = "Search the default branch's commit history. `mode=message` greps commit messages (case-insensitive regex); `mode=patch` finds commits whose diff adds/removes the literal query string — use it to check whether the broken code path was already touched by a fix."
 
@@ -113,5 +119,5 @@ documentation = "fix the docs and open a PR using the four-section template"
 question = "answer in a single gh_post_comment; no PR, no repro"
 enhancement = "post one thoughtful gh_post_comment on feasibility/scope; no PR"
 proposal = "post one thoughtful gh_post_comment on feasibility/scope; no PR"
-invalid = "post one explanatory gh_post_comment; no further action"
-duplicate = "post one explanatory gh_post_comment; no further action"
+invalid = "post one explanatory gh_post_comment, then gh_close_issue(reason='not_planned')"
+duplicate = "post one explanatory gh_post_comment linking the original, then gh_close_issue(reason='not_planned')"
