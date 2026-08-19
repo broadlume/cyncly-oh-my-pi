@@ -260,6 +260,20 @@ class GitHubProxyClient:
         )
         return _comment_from(data)
 
+    async def add_comment_reaction(
+        self, repo: str, comment_id: int, *, content: str = "eyes", pull_request: bool = False
+    ) -> None:
+        await self._request(
+            "POST",
+            "/gh/v1/add_comment_reaction",
+            json_body={
+                "repo": repo,
+                "comment_id": comment_id,
+                "content": content,
+                "pull_request": pull_request,
+            },
+        )
+
     async def open_pull_request(
         self,
         *,

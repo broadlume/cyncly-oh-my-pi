@@ -472,6 +472,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             log.info(
                 "queued", extra={"event": x_github_event, "delivery": x_github_delivery, "key": decision.issue_key}
             )
+            if x_github_event in ("issue_comment", "pull_request_review_comment") and (
+                str(payload.get("action") or "") == "created"
+            ):
+                comment_obj = payload.get("comment") or {}
+                comment_id = comment_obj.get("id")
+                if (
+                    isinstance(comment_id, int)
+                    and decision.repo is not None
+                    and github_events.extract_mention(str(comment_obj.get("body") or ""), cfg.bot_login) is not None
+                ):
+                    github: GitHubBackend = bag["github"]
+                    try:
+                        await github.add_comment_reaction(
+                            decision.repo,
+                            comment_id,
+                            content="eyes",
+                            pull_request=x_github_event == "pull_request_review_comment",
+                        )
+                    except Exception:
+                        log.warning(
+                            "eyes reaction failed",
+                            extra={"delivery": x_github_delivery, "comment_id": comment_id},
+                        )
         else:
             log.info("duplicate", extra={"event": x_github_event, "delivery": x_github_delivery})
         return JSONResponse({"delivery": x_github_delivery, "state": "queued"}, status_code=202)

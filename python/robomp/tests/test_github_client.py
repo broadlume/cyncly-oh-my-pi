@@ -375,6 +375,36 @@ def test_list_comment_reactions_filters_to_thumbs_down() -> None:
     assert all(r.content == "-1" for r in reactions)
 
 
+def test_add_comment_reaction_posts_eyes_to_issue_comment() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(201, json={})
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    assert _run_async(client.add_comment_reaction("octo/widget", 999)) is None
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/repos/octo/widget/issues/comments/999/reactions"
+    assert captured["body"] == {"content": "eyes"}
+
+
+def test_add_comment_reaction_uses_pulls_path_for_review_comments() -> None:
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={})
+
+    client = GitHubClient("tok", transport=httpx.MockTransport(handler))
+    _run_async(client.add_comment_reaction("octo/widget", 999, pull_request=True))
+    assert captured["path"] == "/repos/octo/widget/pulls/comments/999/reactions"
+
+
 def test_close_issue_sends_completed_state_reason() -> None:
     captured: dict[str, object] = {}
 

@@ -593,6 +593,20 @@ def create_proxy_app(settings: Settings) -> FastAPI:
             return _gh_error_response(exc)
         return JSONResponse(_serialize(info))
 
+    @app.post("/gh/v1/add_comment_reaction")
+    async def add_comment_reaction(request: Request) -> JSONResponse:
+        data = await _json_body(request)
+        repo = _require_str(data.get("repo"), "repo")
+        comment_id = _require_int(data.get("comment_id"), "comment_id")
+        content = _require_str(data.get("content"), "content")
+        pull_request = bool(data.get("pull_request", False))
+        github: GitHubClient = request.app.state.github
+        try:
+            await github.add_comment_reaction(repo, comment_id, content=content, pull_request=pull_request)
+        except GitHubError as exc:
+            return _gh_error_response(exc)
+        return JSONResponse({"ok": True})
+
     @app.post("/gh/v1/open_pull_request")
     async def open_pull_request(request: Request) -> JSONResponse:
         data = await _json_body(request)

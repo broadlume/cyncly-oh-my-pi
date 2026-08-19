@@ -1646,6 +1646,117 @@ def test_webhook_maintainer_bypasses_rate_limit(
     }
 
 
+# -------- 👀 reaction on mention ---------------------------------------
+
+
+def _post_issue_comment_with_id(
+    client: TestClient,
+    *,
+    delivery: str,
+    user: str,
+    number: int,
+    comment_id: int,
+    body: str,
+    association: str = "NONE",
+):
+    """Signed `issue_comment.created` payload that carries a comment id."""
+    payload = {
+        "action": "created",
+        "comment": {
+            "id": comment_id,
+            "user": {"login": user},
+            "author_association": association,
+            "body": body,
+        },
+        "issue": {"number": number},
+        "repository": {"full_name": "octo/widget"},
+    }
+    raw = json.dumps(payload).encode()
+    return client.post(
+        "/webhook/github",
+        content=raw,
+        headers=_signed_headers("test-webhook-secret", raw, event="issue_comment", delivery=delivery),
+    )
+
+
+def test_webhook_mention_adds_eyes_reaction(env) -> None:
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        return httpx.Response(201, json={})
+
+    with TestClient(app) as client:
+        _install_github_mock(app, httpx.MockTransport(handler))
+        resp = _post_issue_comment_with_id(
+            client,
+            delivery="eyes-1",
+            user="can1357",
+            number=77,
+            comment_id=4242,
+            body="@robomp-bot please fix",
+            association="OWNER",
+        )
+    close_database()
+    assert resp.status_code == 202
+    assert resp.json()["state"] == "queued"
+    assert calls == [("POST", "/repos/octo/widget/issues/comments/4242/reactions")]
+
+
+def test_webhook_comment_without_mention_gets_no_reaction(env) -> None:
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(201, json={})
+
+    with TestClient(app) as client:
+        _install_github_mock(app, httpx.MockTransport(handler))
+        resp = _post_issue_comment_with_id(
+            client,
+            delivery="eyes-2",
+            user="can1357",
+            number=78,
+            comment_id=4243,
+            body="just a normal comment",
+            association="OWNER",
+        )
+    close_database()
+    assert resp.status_code == 202
+    assert resp.json()["state"] == "queued"
+    assert calls == []
+
+
+def test_webhook_reaction_failure_is_non_fatal(env) -> None:
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+
+    with TestClient(app) as client:
+        _install_github_mock(app, httpx.MockTransport(lambda r: httpx.Response(500, json={"message": "boom"})))
+        resp = _post_issue_comment_with_id(
+            client,
+            delivery="eyes-3",
+            user="can1357",
+            number=79,
+            comment_id=4244,
+            body="@robomp-bot please fix",
+            association="OWNER",
+        )
+        row = get_database(cfg.sqlite_path).get_event("eyes-3")
+    close_database()
+    assert resp.status_code == 202
+    assert resp.json()["state"] == "queued"
+    assert row is not None
+    assert row.state == "queued"
+
+
 # -------- handler-level: bootstrap + reopen ----------------------------
 
 

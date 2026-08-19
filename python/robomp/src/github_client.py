@@ -621,6 +621,21 @@ class GitHubClient:
         )
         return tuple(_reaction_from_payload(item) for item in (data or []))
 
+    async def add_comment_reaction(
+        self, repo: str, comment_id: int, *, content: str = "eyes", pull_request: bool = False
+    ) -> None:
+        """Add a reaction to an issue comment (or review comment when `pull_request`).
+
+        GitHub answers 201 on create and 200 when the reaction already exists, so
+        redelivery is idempotent without extra handling.
+        """
+        base = "pulls" if pull_request else "issues"
+        await self.request(
+            "POST",
+            f"/repos/{repo}/{base}/comments/{comment_id}/reactions",
+            json={"content": content},
+        )
+
     async def close_issue(self, repo: str, number: int, *, reason: str = "completed") -> None:
         """Close an issue with `state_reason` (`completed`/`not_planned`/`reopened`)."""
         await self.request(

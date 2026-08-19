@@ -106,6 +106,10 @@ class GitHubBackend(Protocol):
 
     async def list_comment_reactions(self, repo: str, comment_id: int) -> tuple[ReactionInfo, ...]: ...
 
+    async def add_comment_reaction(
+        self, repo: str, comment_id: int, *, content: str = "eyes", pull_request: bool = False
+    ) -> None: ...
+
     async def close_issue(self, repo: str, number: int, *, reason: str = "completed") -> None: ...
 
 

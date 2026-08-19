@@ -465,6 +465,27 @@ async def test_list_comment_reactions_round_trip(proxy_settings: Settings) -> No
     assert reactions == (ReactionInfo(content="-1", user_login="alice", user_type="User"),)
 
 
+async def test_add_comment_reaction_round_trip(proxy_settings: Settings) -> None:
+    captured: dict[str, object] = {}
+    app = create_proxy_app(proxy_settings)
+    app.state.settings = proxy_settings
+
+    def gh(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/repos/octo/widget/issues/comments/999/reactions" and req.method == "POST":
+            captured["body"] = json.loads(req.content)
+            return httpx.Response(201, json={})
+        return httpx.Response(404, json={"message": "unrouted"})
+
+    _attach_gh(app, gh)
+    client = GitHubProxyClient(
+        base_url="http://proxy.test",
+        hmac_key=_HMAC,
+        transport=httpx.ASGITransport(app=app),
+    )
+    assert await client.add_comment_reaction("octo/widget", 999) is None
+    assert captured["body"] == {"content": "eyes"}
+
+
 async def test_close_issue_round_trip(proxy_settings: Settings) -> None:
     captured: dict[str, object] = {}
     app = create_proxy_app(proxy_settings)
