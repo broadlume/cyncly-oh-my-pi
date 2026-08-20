@@ -37,8 +37,9 @@ export interface RobompStackProps extends cdk.StackProps {
  * - Brand-new VPC with no peering / TGW / shared subnets created by this stack
  * - Instance has no public IP; egress only via NAT
  * - Instance SG: ingress only from the ALB on :8080; egress HTTPS+DNS only
- * - Instance role: GetSecretValue on the stack secret (+ KMS decrypt) ONLY,
- *   plus an explicit Deny on common lateral AWS APIs (S3/EC2/SSM/ECR/…)
+ * - Instance role: GetSecretValue on the stack secret (+ KMS decrypt) and
+ *   log writes to the instance log group ONLY, plus an explicit Deny on
+ *   common lateral AWS APIs (S3/EC2/SSM/ECR/…)
  * - No SSM Session Manager permissions
  * - IMDSv2 required, hop limit 1 (containers cannot reach IMDS)
  * - EBS encrypted with the stack CMK
@@ -164,6 +165,16 @@ export class RobompStack extends cdk.Stack {
       deliverLogsPermissionArn: flowLogRole.roleArn,
       tags: [{ key: "Name", value: `robomp-${props.envName}-flow` }],
     });
+    // ── Instance / container logs ───────────────────────────────────────────
+    // Docker's daemon-default `awslogs` driver ships each container's
+    // stdout/stderr as its own stream (tag {{.Name}}); the CloudWatch agent
+    // ships the host bootstrap/config-render files. Both target this group.
+    const instanceLogGroup = new logs.LogGroup(this, "InstanceLogs", {
+      logGroupName: `robomp/${props.envName}/instance`,
+      retention: logs.RetentionDays.ONE_MONTH,
+      encryptionKey: key,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
 
     // Restrictive NACLs on private subnets.
     const privateNacl = new ec2.NetworkAcl(this, "PrivateNacl", {
@@ -239,6 +250,14 @@ export class RobompStack extends cdk.Stack {
       description: "robomp EC2 - Secrets Manager read on stack secret only",
     });
     secret.grantRead(role);
+    instanceLogGroup.grantWrite(role);
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "DescribeInstanceLogStreams",
+        actions: ["logs:DescribeLogStreams"],
+        resources: [instanceLogGroup.logGroupArn],
+      }),
+    );
     role.addToPolicy(
       new iam.PolicyStatement({
         sid: "DenyLateralAwsApis",
@@ -471,7 +490,8 @@ export class RobompStack extends cdk.Stack {
       .replaceAll("__AWS_REGION__", cdk.Stack.of(this).region)
       .replaceAll("__ROBOMP_IMAGE__", props.robompImage)
       .replaceAll("__LITELLM_IMAGE__", props.litellmImage)
-      .replaceAll("__DATA_DEVICE__", "/dev/xvdf");
+      .replaceAll("__DATA_DEVICE__", "/dev/xvdf")
+      .replaceAll("__ROBOMP_LOG_GROUP__", instanceLogGroup.logGroupName);
 
     const writeFile = (dest: string, contents: string) => {
       userData.addCommands(
@@ -485,16 +505,17 @@ export class RobompStack extends cdk.Stack {
       "set -euo pipefail",
       "mkdir -p /opt/robomp /etc/robomp/agent-home/.agent/rules /etc/robomp/agent-home/.omp/agent",
     );
-    // Secret values are read once at first boot. Bump `-c provisionNonce=<n>`
-    // to change the user-data hash and force an instance replacement (and thus
-    // a re-read of the secret) without any other change.
+    // The secret is re-read on every boot by robomp-config.service, so a
+    // secret change only needs an instance reboot. Bump `-c provisionNonce=<n>`
+    // to change the user-data hash and force a full instance replacement
+    // (fresh AMI/bootstrap) without any other change.
     const provisionNonce = this.node.tryGetContext("provisionNonce");
     if (provisionNonce) {
       userData.addCommands(`# provision-nonce: ${provisionNonce}`);
     }
     // docker-compose.aws.yml and .agent/AGENTS.md ship in the robomp image; the
     // bootstrap extracts the compose file with `docker cp` after GHCR login.
-    writeFile("/etc/robomp/agent-home/.omp/agent/models.yml.tmpl", modelsTmpl);
+    writeFile("/etc/robomp/models.yml.tmpl", modelsTmpl);
     writeFile("/etc/robomp/litellm.config.yaml", litellmCfg);
     // .agent/AGENTS.md ships in the image bundle (layer 1), not user-data.
     writeFile("/etc/robomp/agent-home/.agent/rules/00-aws-isolation.md", rulesMd);
@@ -529,10 +550,11 @@ export class RobompStack extends cdk.Stack {
       securityGroup: instanceSg,
       userData,
       // Re-provisioning path: cloud-init only runs once per instance id, and
-      // the instance has no SSM/SSH access. Any user-data change (e.g. a new
-      // image tag) must replace the instance so the bootstrap re-runs against
-      // the current secret. Data survives on the non-delete-on-termination
-      // EBS volume.
+      // the instance has no SSM/SSH access. A user-data change (e.g. a new
+      // image tag) must replace the instance so the bootstrap re-runs. Secret
+      // changes alone need only a reboot: robomp-config.service re-renders
+      // /etc/robomp/.env from Secrets Manager on every boot. Data survives on
+      // the non-delete-on-termination EBS volume.
       userDataCausesReplacement: true,
       blockDevices: [
         {

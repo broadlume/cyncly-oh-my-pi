@@ -79,8 +79,8 @@ Required keys: `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, `ROBOMP_GH_PROXY_HMAC_KE
 `LITELLM_MASTER_KEY`, `GHCR_USERNAME`, `GHCR_TOKEN`, plus at least one provider
 key (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / …).
 
-Then reboot the instance (or re-run the bootstrap) so compose picks up the
-values:
+`robomp-config.service` re-reads the secret and re-renders `/etc/robomp/.env`
+on every boot, so a reboot picks up the new values:
 
 ```bash
 aws ec2 reboot-instances --instance-ids "$(aws cloudformation describe-stacks   --stack-name Robomp-prod --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)"
@@ -166,8 +166,9 @@ The two halves of `assets/` deploy through different channels:
   the instance is replaced and cloud-init re-renders `/etc/robomp/agent-home`.
 - Optional secret keys `OMP_CONFIG_YML` and `OMP_MCP_JSON` hold whole-file text.
   A written file **replaces** the baked file of the same name; it is not merged.
-  Store them as JSON strings with `\n` escapes, not nested objects. Bump
-  `-c provisionNonce=<n>` to force a re-read of the secret.
+  Store them as JSON strings with `\n` escapes, not nested objects. Secret
+  changes (including these) take effect after a reboot; `-c provisionNonce=<n>`
+  forces a full instance replacement when a clean re-bootstrap is wanted.
 
 EC2 caps user-data at 16 KB. The synth budget is 15,872 bytes — the limit minus a
 512-byte margin, because `UserData.render()` still holds CFN tokens (secret ARN,

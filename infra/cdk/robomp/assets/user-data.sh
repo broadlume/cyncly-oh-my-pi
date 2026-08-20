@@ -9,6 +9,7 @@ AWS_REGION="__AWS_REGION__"
 ROBOMP_IMAGE="__ROBOMP_IMAGE__"
 LITELLM_IMAGE="__LITELLM_IMAGE__"
 DATA_DEVICE="__DATA_DEVICE__"
+LOG_GROUP="__ROBOMP_LOG_GROUP__"
 COMPOSE_DIR=/opt/robomp
 CONFIG_DIR=/etc/robomp
 DATA_MOUNT=/var/lib/docker/volumes
@@ -17,7 +18,7 @@ export AWS_DEFAULT_REGION="$AWS_REGION"
 
 # --- base packages (Amazon Linux 2023) --------------------------------------
 dnf -y update
-dnf -y install docker jq unzip curl-minimal
+dnf -y install docker jq unzip curl-minimal amazon-cloudwatch-agent
 if ! command -v aws >/dev/null 2>&1; then
   dnf -y install awscli || true
 fi
@@ -29,6 +30,22 @@ if ! docker compose version >/dev/null 2>&1; then
   ln -sfn /usr/local/lib/docker/cli-plugins/docker-compose /usr/libexec/docker/cli-plugins/docker-compose
 fi
 
+# Container stdout/stderr -> CloudWatch, one stream per container. Must land
+# before dockerd first starts; the default driver only applies to new containers.
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<EOF
+{
+  "log-driver": "awslogs",
+  "log-opts": {
+    "awslogs-region": "$AWS_REGION",
+    "awslogs-group": "$LOG_GROUP",
+    "tag": "{{.Name}}",
+    "mode": "non-blocking",
+    "max-buffer-size": "4m"
+  }
+}
+EOF
+
 systemctl enable --now docker
 usermod -aG docker ec2-user || true
 
@@ -36,6 +53,18 @@ usermod -aG docker ec2-user || true
 # Hop limit is 1 on the instance, so docker bridge cannot reach 169.254.169.254.
 iptables -C DOCKER-USER -d 169.254.169.254/32 -j DROP 2>/dev/null \
   || iptables -I DOCKER-USER -d 169.254.169.254/32 -j DROP
+
+# CloudWatch agent ships the host bootstrap/config-render logs.
+cat > /etc/robomp/cwagent.json <<EOF
+{
+  "agent": {"run_as_user": "root"},
+  "logs": {"logs_collected": {"files": {"collect_list": [
+    {"file_path": "/var/log/robomp-bootstrap.log", "log_group_name": "$LOG_GROUP", "log_stream_name": "host/bootstrap"},
+    {"file_path": "/var/log/robomp-config.log", "log_group_name": "$LOG_GROUP", "log_stream_name": "host/config-render"}
+  ]}}}
+}
+EOF
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/etc/robomp/cwagent.json
 
 # --- data volume -------------------------------------------------------------
 # Nitro remaps /dev/xvdf -> /dev/nvme1n1 (or similar). Prefer an explicit
@@ -72,6 +101,28 @@ if [ -n "$DATA_DEVICE" ] && [ -b "$DATA_DEVICE" ]; then
 fi
 mkdir -p /var/lib/robomp-data/robomp_data
 mkdir -p "$COMPOSE_DIR" "$CONFIG_DIR/rules"
+
+# --- boot-time config renderer ------------------------------------------------
+# The secret is re-read on EVERY boot by robomp-config.service, so a secret
+# change only needs an instance reboot, not a replacement. Values that come
+# from the deploy (not the secret) land in provision.env for the renderer.
+umask 077
+cat > "$CONFIG_DIR/provision.env" <<EOF
+ROBOMP_SECRET_ARN=${ROBOMP_SECRET_ARN}
+AWS_REGION=${AWS_REGION}
+ROBOMP_IMAGE=${ROBOMP_IMAGE}
+LITELLM_IMAGE=${LITELLM_IMAGE}
+EOF
+umask 022
+
+cat > "$COMPOSE_DIR/render-config.sh" <<'RENDER_EOF'
+#!/bin/bash
+set -euo pipefail
+exec > >(tee -a /var/log/robomp-config.log) 2>&1
+
+echo "[robomp] config render starting $(date -u +%FT%TZ)"
+. /etc/robomp/provision.env
+export AWS_DEFAULT_REGION="$AWS_REGION"
 
 # --- fetch secrets (ONLY AWS API this host is allowed to call) --------------
 for attempt in $(seq 1 30); do
@@ -159,14 +210,13 @@ GROQ_API_KEY=${GROQ_API_KEY}
 EOF
 chmod 0600 /etc/robomp/.env
 
-# Compose files + static assets are written by the CDK user-data preamble
-# into $COMPOSE_DIR and $CONFIG_DIR before this script runs.
-
-AGENT_HOME_DIR=$CONFIG_DIR/agent-home
-if [ -f "$AGENT_HOME_DIR/.omp/agent/models.yml.tmpl" ]; then
+# models.yml is re-rendered from the (persistent) template on every boot so a
+# rotated LITELLM_MASTER_KEY lands after a reboot.
+AGENT_HOME_DIR=/etc/robomp/agent-home
+if [ -f /etc/robomp/models.yml.tmpl ]; then
+  mkdir -p "$AGENT_HOME_DIR/.omp/agent"
   sed "s|__LITELLM_MASTER_KEY__|${LITELLM_MASTER_KEY}|g" \
-    "$AGENT_HOME_DIR/.omp/agent/models.yml.tmpl" > "$AGENT_HOME_DIR/.omp/agent/models.yml"
-  rm -f "$AGENT_HOME_DIR/.omp/agent/models.yml.tmpl"
+    /etc/robomp/models.yml.tmpl > "$AGENT_HOME_DIR/.omp/agent/models.yml"
   chmod 0644 "$AGENT_HOME_DIR/.omp/agent/models.yml"
 fi
 
@@ -184,6 +234,19 @@ for pair in "OMP_CONFIG_YML:.omp/agent/config.yml" "OMP_MCP_JSON:.omp/agent/mcp.
   fi
 done
 
+echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+
+# Scrub secret material from shell history / temp
+unset SECRET_JSON GITHUB_TOKEN GHCR_TOKEN LITELLM_MASTER_KEY ANTHROPIC_API_KEY OPENAI_API_KEY
+rm -f /tmp/robomp-secret.err
+
+echo "[robomp] config render complete $(date -u +%FT%TZ)"
+RENDER_EOF
+chmod 0700 "$COMPOSE_DIR/render-config.sh"
+
+# First render (also performs the GHCR login the extraction below needs).
+"$COMPOSE_DIR/render-config.sh"
+
 # Ensure external volume exists as bind to EBS.
 if ! docker volume inspect robomp_robomp_data >/dev/null 2>&1; then
   docker volume create \
@@ -193,8 +256,6 @@ if ! docker volume inspect robomp_robomp_data >/dev/null 2>&1; then
     --opt o=bind \
     robomp_robomp_data
 fi
-
-echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
 
 # The compose file ships in the robomp image, not in user-data: EC2 caps
 # user-data at 16 KB, and this keeps the compose file and the image that it
@@ -221,12 +282,30 @@ docker compose \
   -f docker-compose.aws.yml \
   up -d
 
-# systemd unit for restart resilience
+# systemd units: config render re-runs on every boot, before the stack starts.
+cat > /etc/systemd/system/robomp-config.service <<EOF
+[Unit]
+Description=robomp config render from Secrets Manager
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+Before=robomp.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${COMPOSE_DIR}/render-config.sh
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 cat > /etc/systemd/system/robomp.service <<EOF
 [Unit]
 Description=robomp docker compose stack
-After=docker.service network-online.target
-Requires=docker.service
+After=docker.service network-online.target robomp-config.service
+Requires=docker.service robomp-config.service
 Wants=network-online.target
 
 [Service]
@@ -242,10 +321,6 @@ TimeoutStartSec=0
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable robomp.service
-
-# Scrub secret material from shell history / temp
-unset SECRET_JSON GITHUB_TOKEN GHCR_TOKEN LITELLM_MASTER_KEY ANTHROPIC_API_KEY OPENAI_API_KEY
-rm -f /tmp/robomp-secret.err
+systemctl enable robomp-config.service robomp.service
 
 echo "[robomp] bootstrap complete $(date -u +%FT%TZ)"

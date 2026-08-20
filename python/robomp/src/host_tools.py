@@ -458,7 +458,8 @@ def _run_pre_publish_bun_fix(
         msg = (
             f"refusing to {stage}: `bun run fix` changed files, but HEAD is authored by "
             f"{author} — refusing to fold the formatter diff into a foreign commit. "
-            "Fix the identity first (`git commit --amend --reset-author --no-edit`) and retry."
+            "Commit the formatter output as your own commit (`git add -A && git commit`) "
+            "and retry. Do not rewrite the author of a commit that is already published."
         )
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
@@ -638,6 +639,7 @@ def _build_post_comment(bindings: ToolBindings) -> HostTool[Any, Any]:
         execute=execute,
     )
 
+
 # ---------- gh_close_issue ----------
 _CLOSE_REASONS: tuple[str, ...] = ("completed", "not_planned")
 
@@ -689,7 +691,6 @@ def _build_close_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
     )
 
 
-
 def _repair_message_escapes(message: str) -> str | None:
     """Convert shell-literal ``\\n`` escapes in a commit message to newlines.
 
@@ -713,32 +714,56 @@ def _repair_message_escapes(message: str) -> str | None:
     return "`".join(parts) if changed else None
 
 
+def _remote_head_ref(bindings: ToolBindings) -> str | None:
+    """``origin/<branch>`` when the workspace branch already exists on origin, else None."""
+    branch = bindings.workspace.branch
+    probe = _run_repo_command(bindings, ["git", "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"])
+    if probe.returncode == 0 and probe.stdout.strip():
+        return f"origin/{branch}"
+    return None
+
+
+def _unpublished_range(bindings: ToolBindings, remote_head: str | None) -> tuple[str, str]:
+    """Revision range covering only commits this workspace has not published yet.
+
+    Returns ``(range, exclude_ref)``. When the head branch already exists on
+    origin — a follow-up on someone else's PR (Dependabot bumps, human merge
+    commits) — the range starts at ``origin/<branch>`` so gates never judge or
+    rewrite published history the bot did not author. For a brand-new branch
+    the remote ref is absent and the range falls back to ``origin/<default>``.
+    """
+    exclude = remote_head or f"origin/{bindings.repo.default_branch}"
+    return f"{exclude}..HEAD", exclude
+
+
 def _repair_commit_message_escapes(bindings: ToolBindings, args: Mapping[str, Any], *, tool_name: str) -> None:
     """Rewrite unpushed commits whose messages carry literal ``\\n`` escapes.
 
-    Rebuilds ``origin/<base>..HEAD`` with ``git commit-tree``, preserving
-    every tree, parent topology, identity, and date — only messages change.
-    Safe against already-pushed commits: the push transport uses
-    ``--force-with-lease``. Once a broken message is detected the repair is
+    Rebuilds only the commits this workspace has not published yet (see
+    ``_unpublished_range``) with ``git commit-tree``, preserving every tree,
+    parent topology, identity, and date — only messages change. Commits
+    already on the remote head branch are never touched.
+
+    Once a broken message is detected the repair is
     mandatory — a git failure mid-rewrite refuses the push (the branch ref
     itself only ever moves via the compare-and-swap ``update-ref`` at the
     very end, so a refusal never leaves partial state).
     """
+    rev_range, exclude = _unpublished_range(bindings, _remote_head_ref(bindings))
+    rev_list = _run_repo_command(bindings, ["git", "rev-list", "--reverse", rev_range])
 
     def fail(step: str, proc: subprocess.CompletedProcess[str]) -> NoReturn:
         err = (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
         msg = (
             f"refusing to push: commit messages contain literal `\\n` escapes and the "
             f"automatic repair failed at `{step}`: {err}\n"
-            "Reword the affected commits yourself (`git rebase -i origin/"
-            + bindings.repo.default_branch
+            "Reword the affected commits yourself (`git rebase -i "
+            + exclude
             + "`, real newlines via `git commit -F <file>` or multiple `-m` flags) and retry."
         )
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
 
-    base = bindings.repo.default_branch
-    rev_list = _run_repo_command(bindings, ["git", "rev-list", "--reverse", f"origin/{base}..HEAD"])
     if rev_list.returncode != 0:
         return
     shas = rev_list.stdout.split()
@@ -836,17 +861,19 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
         _raise_command(f"git rev-parse failed: {err}")
     head_sha = head_proc.stdout.strip()
 
-    # Identity gate: every commit between the base branch and HEAD must
-    # carry the configured author. Refuse to push otherwise so the agent
-    # fixes it (`git commit --amend --reset-author --no-edit`).
-    base = bindings.repo.default_branch
+    # Identity gate: every commit this push would add must carry the
+    # configured author. The range excludes commits already published on the
+    # head branch (Dependabot bumps, human merge commits on an existing PR) —
+    # judging those would force the agent to rewrite history it does not own.
+    remote_head = _remote_head_ref(bindings)
+    rev_range, exclude = _unpublished_range(bindings, remote_head)
     identities = _run_repo_command(
         bindings,
-        ["git", "log", "--format=%H%x09%ae%x09%an", f"origin/{base}..HEAD"],
+        ["git", "log", "--format=%H%x09%ae%x09%an", rev_range],
     )
     if identities.returncode != 0:
         err = (identities.stderr or identities.stdout).strip()
-        msg = f"refusing to push: could not inspect commit authors for origin/{base}..HEAD: {err}"
+        msg = f"refusing to push: could not inspect commit authors for {rev_range}: {err}"
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
     offending: list[str] = []
@@ -864,11 +891,49 @@ def _guarded_push_branch(bindings: ToolBindings, args: Mapping[str, Any], tool_n
             f"Expected `{bindings.author_name} <{bindings.author_email}>`. "
             f"Offending commits:\n  {details}\n"
             "Amend each commit with `git commit --amend --reset-author --no-edit` "
-            "(or rebase with `git rebase -i origin/" + base + " --exec "
+            "(or rebase with `git rebase -i " + exclude + " --exec "
             "'git commit --amend --reset-author --no-edit'`) and try again."
         )
         _audit(bindings, tool_name, args, error=msg)
         _raise_command(msg)
+
+    # Clobber gate: the transport pushes with `--force-with-lease` pinned to the
+    # remote ref as of the fetch at the start of this event, so a stale worktree
+    # would silently drop commits someone else pushed to the head branch in the
+    # meantime (human follow-up work on the bot's own PR). Commits the remote has
+    # and HEAD lacks are only acceptable when the bot authored them — that is the
+    # bot rewriting its own history (`git commit --amend`), which the lease exists
+    # to support.
+    if remote_head is not None:
+        dropped = _run_repo_command(
+            bindings,
+            ["git", "log", "--format=%H%x09%ae%x09%an", remote_head, "^HEAD"],
+        )
+        if dropped.returncode != 0:
+            err = (dropped.stderr or dropped.stdout).strip()
+            msg = f"refusing to push: could not compare HEAD against {remote_head}: {err}"
+            _audit(bindings, tool_name, args, error=msg)
+            _raise_command(msg)
+        foreign: list[str] = []
+        for line in (dropped.stdout or "").strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            sha, email, name = parts[0], parts[1], parts[2]
+            if email != bindings.author_email or name != bindings.author_name:
+                foreign.append(f"{sha[:12]} {name} <{email}>")
+        if foreign:
+            details = "\n  ".join(foreign)
+            msg = (
+                f"refusing to push: this push would discard commits on {remote_head} "
+                "that you did not author:\n  "
+                f"{details}\n"
+                f"Your checkout is behind the remote branch. Rebase onto it "
+                f"(`git fetch origin {bindings.workspace.branch} && git rebase {remote_head}`), "
+                "re-verify, and push again. Never force past someone else's work."
+            )
+            _audit(bindings, tool_name, args, error=msg)
+            _raise_command(msg)
 
     # Working-tree cleanliness gate. Any uncommitted change (edits the agent
     # forgot to `git add && git commit`, files dropped by package managers, etc.)

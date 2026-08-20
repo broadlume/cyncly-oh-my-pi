@@ -2010,6 +2010,318 @@ def test_gh_push_branch_rejects_wrong_identity(db: Database, tmp_path: Path) -> 
         _stop_loop(loop, thread)
 
 
+def test_gh_push_branch_allows_foreign_published_commits(db: Database, tmp_path: Path) -> None:
+    """Commits already published on the head branch are outside the identity gate.
+
+    Follow-ups on someone else's PR (a Dependabot bump plus a human merge
+    commit) must push without the agent rewriting history it does not own.
+    """
+    import os
+    import subprocess
+
+    bare = tmp_path / "upstream.git"
+    bare.mkdir()
+    subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(bare)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    branch = "dependabot/npm_and_yarn/uuid-14.0.0"
+
+    def commit(name: str, email: str, message: str) -> None:
+        env = os.environ | {
+            "GIT_AUTHOR_NAME": name,
+            "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": name,
+            "GIT_COMMITTER_EMAIL": email,
+        }
+        subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(seed), "-c", f"user.email={email}", "-c", f"user.name={name}", "commit", "-m", message],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+
+    subprocess.run(["git", "init", "--initial-branch=main", str(seed)], check=True, capture_output=True)
+    (seed / "README.md").write_text("init\n")
+    commit("seed", "seed@x", "init")
+    subprocess.run(["git", "-C", str(seed), "remote", "add", "origin", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "push", "origin", "main"], check=True, capture_output=True)
+    # Published branch: a Dependabot bump plus a human merge-style commit.
+    subprocess.run(["git", "-C", str(seed), "checkout", "-b", branch], check=True, capture_output=True)
+    (seed / "package.json").write_text('{"uuid":"14.0.0"}\n')
+    commit("dependabot[bot]", "dependabot@github.com", "chore(deps): bump uuid")
+    (seed / "merge.txt").write_text("merged main\n")
+    commit("Human Dev", "human@example.com", "Merge branch 'main'")
+    subprocess.run(["git", "-C", str(seed), "push", "origin", branch], check=True, capture_output=True)
+    published = subprocess.run(
+        ["git", "-C", str(seed), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    from robomp.sandbox import SandboxManager
+
+    mgr = SandboxManager(tmp_path / "workspaces")
+    ws = mgr.ensure_workspace(
+        repo="octo/widget",
+        number=211,
+        title="uuid bump",
+        clone_url=str(bare),
+        default_branch="main",
+        existing_branch=branch,
+        author_name="robomp-bot",
+        author_email="robomp-bot@example.invalid",
+    )
+    assert ws.branch == branch
+    bot_env = os.environ | {
+        "GIT_AUTHOR_NAME": "robomp-bot",
+        "GIT_AUTHOR_EMAIL": "robomp-bot@example.invalid",
+        "GIT_COMMITTER_NAME": "robomp-bot",
+        "GIT_COMMITTER_EMAIL": "robomp-bot@example.invalid",
+    }
+    (ws.repo_dir / "bun.lock").write_text("uuid@14.0.0\n")
+    subprocess.run(["git", "-C", str(ws.repo_dir), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(ws.repo_dir),
+            "-c",
+            "user.email=robomp-bot@example.invalid",
+            "-c",
+            "user.name=robomp-bot",
+            "commit",
+            "-m",
+            "fix(deps): sync bun.lock",
+        ],
+        check=True,
+        capture_output=True,
+        env=bot_env,
+    )
+    head = subprocess.run(
+        ["git", "-C", str(ws.repo_dir), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    github = GitHubClient("tok", transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    loop, thread = _make_loop_in_background()
+    try:
+        bindings = ToolBindings(
+            db=db,
+            github=github,
+            git_transport=LocalGitTransport(token=None),
+            repo=_stub_repo(),
+            issue=IssueInfo(
+                repo="octo/widget",
+                number=211,
+                title="uuid bump",
+                body="",
+                state="open",
+                author="dependabot[bot]",
+                labels=(),
+                is_pull_request=True,
+            ),
+            workspace=ws,
+            loop=loop,
+            author_name="robomp-bot",
+            author_email="robomp-bot@example.invalid",
+        )
+        db.upsert_issue(
+            key=bindings.issue_key,
+            repo="octo/widget",
+            number=211,
+            state="reproducing",
+            branch=ws.branch,
+            session_dir=str(ws.session_dir),
+        )
+        db.set_issue_classification(bindings.issue_key, "bug")
+        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+        result = tool.execute({}, _ctx())
+    finally:
+        _stop_loop(loop, thread)
+
+    assert result.startswith(f"pushed {branch} ")
+    remote_head = subprocess.run(
+        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert remote_head == head
+    # The foreign commits stayed exactly where they were — no authorship rewrite.
+    ancestry = subprocess.run(
+        ["git", "-C", str(bare), "merge-base", "--is-ancestor", published, remote_head],
+        capture_output=True,
+    )
+    assert ancestry.returncode == 0
+
+
+def test_gh_push_branch_refuses_to_clobber_newer_foreign_commits(db: Database, tmp_path: Path) -> None:
+    """A stale worktree must not force-push over commits someone else pushed.
+
+    The transport's `--force-with-lease` is pinned to the remote ref as of the
+    fetch at the start of the event, so it accepts a rewrite that drops a human
+    commit landed on the head branch after the bot's last push. The clobber gate
+    refuses instead and leaves the remote untouched.
+    """
+    import os
+    import subprocess
+
+    bare = tmp_path / "upstream.git"
+    bare.mkdir()
+    subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(bare)], check=True, capture_output=True)
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    branch = "farm/deadbeef/human-pr"
+
+    def seed_commit(name: str, email: str, message: str) -> str:
+        env = os.environ | {
+            "GIT_AUTHOR_NAME": name,
+            "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": name,
+            "GIT_COMMITTER_EMAIL": email,
+        }
+        subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(seed), "-c", f"user.email={email}", "-c", f"user.name={name}", "commit", "-m", message],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+        return subprocess.run(
+            ["git", "-C", str(seed), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    subprocess.run(["git", "init", "--initial-branch=main", str(seed)], check=True, capture_output=True)
+    (seed / "README.md").write_text("init\n")
+    seed_commit("seed", "seed@x", "init")
+    subprocess.run(["git", "-C", str(seed), "remote", "add", "origin", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(seed), "push", "origin", "main"], check=True, capture_output=True)
+    # A human opens the PR branch, then asks the bot for work.
+    subprocess.run(["git", "-C", str(seed), "checkout", "-b", branch], check=True, capture_output=True)
+    (seed / "feature.txt").write_text("human work\n")
+    seed_commit("Human Dev", "human@example.com", "feat: human work")
+    subprocess.run(["git", "-C", str(seed), "push", "origin", branch], check=True, capture_output=True)
+
+    from robomp.sandbox import SandboxManager
+
+    mgr = SandboxManager(tmp_path / "workspaces")
+
+    def ensure() -> Workspace:
+        return mgr.ensure_workspace(
+            repo="octo/widget",
+            number=77,
+            title="human pr",
+            clone_url=str(bare),
+            default_branch="main",
+            existing_branch=branch,
+            author_name="robomp-bot",
+            author_email="robomp-bot@example.invalid",
+        )
+
+    ws = ensure()
+    assert ws.branch == branch
+    bot_env = os.environ | {
+        "GIT_AUTHOR_NAME": "robomp-bot",
+        "GIT_AUTHOR_EMAIL": "robomp-bot@example.invalid",
+        "GIT_COMMITTER_NAME": "robomp-bot",
+        "GIT_COMMITTER_EMAIL": "robomp-bot@example.invalid",
+    }
+
+    def bot_commit(path: str, body: str, message: str) -> None:
+        (ws.repo_dir / path).write_text(body)
+        subprocess.run(["git", "-C", str(ws.repo_dir), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ws.repo_dir),
+                "-c",
+                "user.email=robomp-bot@example.invalid",
+                "-c",
+                "user.name=robomp-bot",
+                "commit",
+                "-m",
+                message,
+            ],
+            check=True,
+            capture_output=True,
+            env=bot_env,
+        )
+
+    github = GitHubClient("tok", transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    loop, thread = _make_loop_in_background()
+    try:
+        bindings = ToolBindings(
+            db=db,
+            github=github,
+            git_transport=LocalGitTransport(token=None),
+            repo=_stub_repo(),
+            issue=IssueInfo(
+                repo="octo/widget",
+                number=77,
+                title="human pr",
+                body="",
+                state="open",
+                author="human",
+                labels=(),
+                is_pull_request=True,
+            ),
+            workspace=ws,
+            loop=loop,
+            author_name="robomp-bot",
+            author_email="robomp-bot@example.invalid",
+        )
+        db.upsert_issue(
+            key=bindings.issue_key,
+            repo="octo/widget",
+            number=77,
+            state="reproducing",
+            branch=ws.branch,
+            session_dir=str(ws.session_dir),
+        )
+        db.set_issue_classification(bindings.issue_key, "bug")
+        tool = next(x for x in build(bindings) if x.name == "gh_push_branch")
+
+        # First round: the bot adds its own commit and pushes cleanly.
+        bot_commit("bot.txt", "bot round one\n", "fix: bot round one")
+        assert tool.execute({}, _ctx()).startswith(f"pushed {branch} ")
+
+        # The human pushes on top of the bot's commit.
+        subprocess.run(["git", "-C", str(seed), "fetch", "origin", branch], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(seed), "reset", "--hard", "FETCH_HEAD"], check=True, capture_output=True)
+        (seed / "feature.txt").write_text("human work, revised\n")
+        human_head = seed_commit("Human Dev", "human@example.com", "feat: human revision")
+        subprocess.run(["git", "-C", str(seed), "push", "origin", branch], check=True, capture_output=True)
+
+        # Next event: the pool refetches (remote ref advances) but the worktree
+        # is reused, so HEAD stays on the bot's earlier commit.
+        ensure()
+        bot_commit("bot.txt", "bot round two\n", "fix: bot round two")
+        with pytest.raises(RpcCommandError) as exc:
+            tool.execute({}, _ctx())
+        msg = str(exc.value)
+        assert "would discard commits" in msg
+        assert "Human Dev <human@example.com>" in msg
+    finally:
+        _stop_loop(loop, thread)
+
+    # The human's commit is still the remote head.
+    remote_head = subprocess.run(
+        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert remote_head == human_head
+
+
 def test_gh_open_pr_rejects_wrong_identity_before_push_or_pr(db: Database, tmp_path: Path) -> None:
     """gh_open_pr uses the guarded push path before creating the pull request."""
     import os

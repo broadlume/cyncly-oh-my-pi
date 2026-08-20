@@ -154,11 +154,23 @@ The integration test spawns a real `omp --mode rpc` against an
   `https://user:pw@host` to `https://***@host` from argv, stdout, stderr
   before raising. `host_tools._audit` only records agent-supplied args.
 - Pre-push gates (`gh_push_branch`): branch matches the workspace
-  branch, working tree clean, every commit on
-  `origin/<default>..HEAD` carries `ROBOMP_GIT_AUTHOR_NAME` +
-  `ROBOMP_GIT_AUTHOR_EMAIL`. Commit messages carrying shell-literal
-  `\n` escapes (agents quoting `git commit -m 'a\n\nb'`) are rewritten
-  to real newlines — message-only, trees/identities/dates preserved.
+  branch, working tree clean, every *unpublished* commit carries
+  `ROBOMP_GIT_AUTHOR_NAME` + `ROBOMP_GIT_AUTHOR_EMAIL`. The gate range
+  is `origin/<head-branch>..HEAD` when the head branch already exists
+  on origin (follow-ups on a Dependabot or human PR), else
+  `origin/<default>..HEAD`; commits the bot did not author and did not
+  create are never judged or rewritten. Commit messages carrying
+  shell-literal `\n` escapes (agents quoting `git commit -m 'a\n\nb'`)
+  are rewritten to real newlines — message-only, trees/identities/dates
+  preserved, unpublished commits only.
+- Clobber gate (`gh_push_branch`): the transport pushes with
+  `--force-with-lease` pinned to the remote ref as of this event's fetch,
+  so a reused (stale) worktree could otherwise drop commits pushed to the
+  head branch since the bot's last push. Any commit on
+  `origin/<head-branch>` that HEAD lacks and the bot did not author
+  refuses the push; the agent must rebase onto the remote branch. Commits
+  the bot itself authored may still be rewritten, which is what keeps
+  `git commit --amend` recovery working.
 - Pre-PR gates (`gh_open_pr`): when the repo defines them, `bun run fix`
   runs first (any diff amended into the agent's HEAD commit — no
   standalone `style:` noise commits) and then
@@ -193,7 +205,8 @@ The integration test spawns a real `omp --mode rpc` against an
 |---|---|
 | `401 invalid signature` | `GITHUB_WEBHOOK_SECRET` mismatch with the repo webhook config. |
 | `git push: Authentication required` | Bot PAT lacks push, or `ROBOMP_BOT_LOGIN` does not identify the PAT account's mention handle (production: `roboomp`, no `@`/`[bot]`). |
-| `refusing to push: commit author identity mismatch` | Some commit not authored as `ROBOMP_GIT_AUTHOR_*`. The error lists the offending shas; `git commit --amend --reset-author --no-edit`. |
+| `refusing to push: commit author identity mismatch` | One of *your own* new commits is not authored as `ROBOMP_GIT_AUTHOR_*`. The error lists the offending shas; `git commit --amend --reset-author --no-edit`. Commits already on the remote head branch are excluded, so never rewrite published history to satisfy this gate. |
+| `refusing to push: this push would discard commits` | Someone pushed to the head branch after the bot's last push and the reused worktree is behind. Rebase onto `origin/<head-branch>` and re-verify; never force past it. |
 | `refusing to push: working tree is dirty` | Uncommitted agent edits. Or just call `gh_open_pr`, which auto-commits `bun run fix` output. |
 | `bun check failed before PR creation` | Fix the reported failure and retry `gh_open_pr`. |
 | `Failed to load pi_natives` | Wrong arch / missing native. `cd python/robomp && docker compose build` and restart. |
